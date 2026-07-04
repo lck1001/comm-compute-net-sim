@@ -5,6 +5,9 @@
   summary: {},
   selectedTaskId: null,
   selectedNodeId: null,
+  popupNodeId: null,
+  popupRenderKey: null,
+  originOptionsKey: null,
   priority: '中',
   mouse: { x: 0, y: 0, inside: false },
   nodeScreen: new Map(),
@@ -18,6 +21,7 @@ const el = {
   activeLinks: document.querySelector('#activeLinks'),
   avgUtil: document.querySelector('#avgUtil'),
   runningTasks: document.querySelector('#runningTasks'),
+  nodeTypeBreakdown: document.querySelector('#nodeTypeBreakdown'),
   onlineNodes: document.querySelector('#onlineNodes'),
   completeTasks: document.querySelector('#completeTasks'),
   rejectedTasks: document.querySelector('#rejectedTasks'),
@@ -25,6 +29,7 @@ const el = {
   computeInput: document.querySelector('#computeInput'),
   storageInput: document.querySelector('#storageInput'),
   dataInput: document.querySelector('#dataInput'),
+  splitStrategy: document.querySelector('#splitStrategy'),
   injectTask: document.querySelector('#injectTask'),
   taskList: document.querySelector('#taskList'),
   nodeDetail: document.querySelector('#nodeDetail'),
@@ -33,6 +38,7 @@ const el = {
   traceTitle: document.querySelector('#traceTitle'),
   traceStatus: document.querySelector('#traceStatus'),
   hoverTip: document.querySelector('#hoverTip'),
+  nodePopup: document.querySelector('#nodePopup'),
   networkCanvas: document.querySelector('#networkCanvas'),
   traceCanvas: document.querySelector('#traceCanvas')
 };
@@ -53,6 +59,21 @@ function percent(value) {
   return `${Math.round((value || 0) * 100)}%`;
 }
 
+function splitLabel(strategy) {
+  return strategy === 'resourceWeighted' ? '资源权重' : '默认均分';
+}
+
+function linkRoleLabel(role) {
+  const labels = {
+    'terminal-edge': '端-边主链路',
+    'edge-cloud': '边-云主链路',
+    'edge-mesh': '边缘互联',
+    'terminal-peer': '终端邻近',
+    'terminal-cloud-exception': '端-云弹性'
+  };
+  return labels[role] || '灵活链路';
+}
+
 function selectedTask() {
   return state.tasks.find((task) => task.id === state.selectedTaskId) || state.tasks[0] || null;
 }
@@ -62,10 +83,12 @@ function nodeById(id) {
 }
 
 function linkColor(link) {
-  if (!link.active) return 'rgba(77, 91, 101, 0.22)';
-  if (link.utilization > 0.78) return 'rgba(241, 127, 138, 0.62)';
-  if (link.utilization > 0.52) return 'rgba(246, 196, 83, 0.52)';
-  return 'rgba(112, 167, 255, 0.34)';
+  if (!link.active) return 'rgba(83, 102, 113, 0.34)';
+  if (link.utilization > 0.78) return 'rgba(241, 127, 138, 0.92)';
+  if (link.utilization > 0.52) return 'rgba(246, 196, 83, 0.82)';
+  if (link.role === 'terminal-edge') return 'rgba(65, 214, 166, 0.72)';
+  if (link.role === 'edge-cloud') return 'rgba(246, 196, 83, 0.78)';
+  return 'rgba(112, 167, 255, 0.64)';
 }
 
 function resizeCanvas(canvas, context) {
@@ -87,6 +110,8 @@ function updateSummary() {
   el.activeLinks.textContent = `${fmt(s.activeLinks)}/${fmt(s.totalLinks)}`;
   el.avgUtil.textContent = percent(s.avgUtilization);
   el.runningTasks.textContent = fmt(s.runningTasks);
+  const types = s.nodeTypes || {};
+  el.nodeTypeBreakdown.textContent = `云 ${fmt(types.Cloud || 0)} · 边 ${fmt(types.Edge || 0)}/${fmt(s.edgeLimit || 0)} · 端 ${fmt(types.Terminal || 0)}`;
   el.onlineNodes.textContent = `${fmt(s.onlineNodes)} 在线`;
   el.completeTasks.textContent = `${fmt(s.completeTasks)} 完成`;
   el.rejectedTasks.textContent = `${fmt(s.rejectedTasks)} 拒绝`;
@@ -95,10 +120,14 @@ function updateSummary() {
 
 function renderOriginOptions() {
   const previous = el.originSelect.value;
-  const interesting = state.nodes
-    .filter((node) => node.status === 'online')
-    .sort((a, b) => b.computeFree - a.computeFree)
-    .slice(0, 55);
+  const signature = state.nodes.map((node) => `${node.id}:${node.type}:${node.label}`).join('|');
+  if (signature === state.originOptionsKey) {
+    if (state.nodes.some((node) => node.id === previous)) el.originSelect.value = previous;
+    return;
+  }
+  state.originOptionsKey = signature;
+  const interesting = [...state.nodes]
+    .sort((a, b) => a.type.localeCompare(b.type) || a.id.localeCompare(b.id));
   el.originSelect.innerHTML = interesting
     .map((node) => `<option value="${node.id}">${node.id} · ${node.label}</option>`)
     .join('');
@@ -121,6 +150,7 @@ function renderTaskList() {
         <div class="meta-row">
           <span>源 ${task.origin}</span>
           <span>${task.fragments.length} 片</span>
+          <span>${splitLabel(task.splitStrategy)}</span>
           <span>算力 ${fmt(task.demand.compute)}</span>
           <span>数据 ${fmt(task.demand.data)} MB</span>
         </div>
@@ -144,6 +174,7 @@ function renderNodeDetail(node) {
   }
   const active = state.links.filter((link) => link.active && (link.a === node.id || link.b === node.id));
   const avgLatency = active.length ? active.reduce((sum, link) => sum + link.latency, 0) / active.length : 0;
+  const avgCapacity = active.length ? active.reduce((sum, link) => sum + link.bandwidth * (1 - link.utilization), 0) / active.length : 0;
   el.nodeDetail.innerHTML = `<article class="detail-card">
     <h3>${node.id}</h3>
     <div class="detail-list">
@@ -153,10 +184,56 @@ function renderNodeDetail(node) {
       <span><b>剩余算力</b><em>${fmt(node.computeFree)} / ${fmt(node.computeTotal)}</em></span>
       <span><b>剩余存储</b><em>${fmt(node.storageFree)} / ${fmt(node.storageTotal)}</em></span>
       <span><b>链路数</b><em>${active.length}</em></span>
+      <span><b>可用通信容量</b><em>${fmt(avgCapacity)} Mbps</em></span>
       <span><b>平均时延</b><em>${fmt(avgLatency)} ms</em></span>
       <span><b>收/发</b><em>${fmt(node.rxMbps)} / ${fmt(node.txMbps)} Mbps</em></span>
     </div>
   </article>`;
+}
+
+function renderNodePopup(node, point, rect) {
+  if (!node || !point) {
+    el.nodePopup.classList.add('hidden');
+    state.popupRenderKey = null;
+    return;
+  }
+  const active = state.links.filter((link) => link.active && (link.a === node.id || link.b === node.id));
+  const avgLatency = active.length ? active.reduce((sum, link) => sum + link.latency, 0) / active.length : 0;
+  const avgCapacity = active.length ? active.reduce((sum, link) => sum + link.bandwidth * (1 - link.utilization), 0) / active.length : 0;
+  const left = Math.min(rect.width - 286, Math.max(10, point.x + 16));
+  const top = Math.min(rect.height - 244, Math.max(10, point.y - 28));
+  el.nodePopup.style.left = `${left}px`;
+  el.nodePopup.style.top = `${top}px`;
+  const renderKey = [
+    node.id,
+    node.status,
+    node.computeFree,
+    node.storageFree,
+    active.length,
+    Math.round(avgLatency),
+    Math.round(avgCapacity),
+    Math.round(node.rxMbps),
+    Math.round(node.txMbps)
+  ].join('|');
+  if (state.popupRenderKey === renderKey) {
+    el.nodePopup.classList.remove('hidden');
+    return;
+  }
+  state.popupRenderKey = renderKey;
+  el.nodePopup.innerHTML = `<header>
+      <div><b>${node.id}</b><span>${node.label} · ${node.status}</span></div>
+      <button type="button" data-close-popup aria-label="close">×</button>
+    </header>
+    <div class="popup-grid">
+      <span><b>通信容量</b><em>${fmt(avgCapacity)} Mbps</em></span>
+      <span><b>链路数量</b><em>${active.length}</em></span>
+      <span><b>剩余算力</b><em>${fmt(node.computeFree)} / ${fmt(node.computeTotal)}</em></span>
+      <span><b>剩余存储</b><em>${fmt(node.storageFree)} / ${fmt(node.storageTotal)}</em></span>
+      <span><b>平均时延</b><em>${fmt(avgLatency)} ms</em></span>
+      <span><b>收/发速率</b><em>${fmt(node.rxMbps)} / ${fmt(node.txMbps)} Mbps</em></span>
+    </div>
+    <button type="button" class="popup-action" data-start-from-node>以该节点发起任务</button>`;
+  el.nodePopup.classList.remove('hidden');
 }
 
 function renderLinksTable() {
@@ -167,6 +244,7 @@ function renderLinksTable() {
     .map((link) => `<tr>
       <td>${link.id}</td>
       <td>${link.a} ⇄ ${link.b}</td>
+      <td>${linkRoleLabel(link.role)}</td>
       <td>${fmt(link.bandwidth)}</td>
       <td>${fmt(link.latency)}</td>
       <td>${fmt(link.loss, 2)}</td>
@@ -265,7 +343,9 @@ function drawTopology(time = 0) {
     if (!a || !b) continue;
     ctx.globalAlpha = link.active ? 1 : 0.45;
     ctx.strokeStyle = linkColor(link);
-    ctx.lineWidth = link.active ? Math.max(0.6, link.utilization * 2.8) : 0.6;
+    ctx.lineWidth = link.active ? Math.max(1, 1.2 + link.utilization * 3.2) : 0.8;
+    ctx.shadowColor = link.active ? linkColor(link) : 'transparent';
+    ctx.shadowBlur = link.active ? 5 : 0;
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
@@ -276,11 +356,14 @@ function drawTopology(time = 0) {
       const px = a.x + (b.x - a.x) * t;
       const py = a.y + (b.y - a.y) * t;
       ctx.fillStyle = link.utilization > 0.78 ? '#f17f8a' : '#41d6a6';
+      ctx.shadowColor = ctx.fillStyle;
+      ctx.shadowBlur = 9;
       ctx.beginPath();
-      ctx.arc(px, py, 2.2, 0, Math.PI * 2);
+      ctx.arc(px, py, 2.8, 0, Math.PI * 2);
       ctx.fill();
     }
   }
+  ctx.shadowBlur = 0;
   ctx.restore();
 
   const task = selectedTask();
@@ -292,8 +375,10 @@ function drawTopology(time = 0) {
         const a = state.nodeScreen.get(fragment.path[i]);
         const b = state.nodeScreen.get(fragment.path[i + 1]);
         if (!a || !b) continue;
-        ctx.strokeStyle = 'rgba(65, 214, 166, 0.85)';
-        ctx.lineWidth = 2.4;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+        ctx.shadowColor = 'rgba(65, 214, 166, 0.95)';
+        ctx.shadowBlur = 12;
+        ctx.lineWidth = 3.2;
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         ctx.lineTo(b.x, b.y);
@@ -313,7 +398,7 @@ function drawTopology(time = 0) {
   for (const node of state.nodes) {
     const point = state.nodeScreen.get(node.id);
     if (!point) continue;
-    const base = node.type === 'Core' ? 6.8 : node.type === 'Edge' ? 5.2 : 3.8;
+    const base = node.type === 'Cloud' ? 7.6 : node.type === 'Edge' ? 5.5 : 3.8;
     const ring = base + (node.txMbps + node.rxMbps > 0 ? Math.sin(time / 180 + node.pulse * 6.28) * 2 + 5 : 0);
     ctx.fillStyle = node.status === 'online' ? node.color : '#58656c';
     ctx.strokeStyle = node.status === 'online' ? 'rgba(255,255,255,0.7)' : 'rgba(180,190,190,0.32)';
@@ -331,6 +416,7 @@ function drawTopology(time = 0) {
     ctx.stroke();
   }
   updateHover(rect);
+  if (state.popupNodeId) renderNodePopup(nodeById(state.popupNodeId), state.nodeScreen.get(state.popupNodeId), rect);
 }
 
 function renderTrace() {
@@ -402,6 +488,7 @@ function applyState(payload) {
   state.tick = payload.tick || 0;
   if (!state.selectedTaskId && state.tasks.length) state.selectedTaskId = state.tasks[0].id;
   if (state.selectedTaskId && !state.tasks.some((task) => task.id === state.selectedTaskId)) state.selectedTaskId = state.tasks[0]?.id || null;
+  if (state.popupNodeId && !state.nodes.some((node) => node.id === state.popupNodeId)) state.popupNodeId = null;
   renderAll();
 }
 
@@ -423,7 +510,8 @@ async function injectTask() {
     compute: Number(el.computeInput.value),
     storage: Number(el.storageInput.value),
     data: Number(el.dataInput.value),
-    priority: state.priority
+    priority: state.priority,
+    splitStrategy: el.splitStrategy?.value || 'equal'
   };
   el.injectTask.disabled = true;
   try {
@@ -467,7 +555,9 @@ function bindEvents() {
     state.mouse.inside = false;
     el.hoverTip.classList.add('hidden');
   });
-  el.networkCanvas.addEventListener('click', () => {
+  el.networkCanvas.addEventListener('click', (event) => {
+    const rect = el.networkCanvas.getBoundingClientRect();
+    state.mouse = { x: event.clientX - rect.left, y: event.clientY - rect.top, inside: true };
     let nearest = null;
     let nearestDistance = Infinity;
     for (const [id, point] of state.nodeScreen.entries()) {
@@ -479,7 +569,32 @@ function bindEvents() {
     }
     if (nearest && nearestDistance < 14) {
       state.selectedNodeId = nearest;
+      state.popupNodeId = nearest;
+      el.originSelect.value = nearest;
       renderNodeDetail(nodeById(nearest));
+      renderNodePopup(nodeById(nearest), state.nodeScreen.get(nearest), rect);
+    } else {
+      state.popupNodeId = null;
+      state.popupRenderKey = null;
+      el.nodePopup.classList.add('hidden');
+    }
+  });
+
+  el.nodePopup.addEventListener('pointerdown', (event) => {
+    if (event.target.closest('[data-close-popup]')) {
+      event.preventDefault();
+      event.stopPropagation();
+      state.popupNodeId = null;
+      state.popupRenderKey = null;
+      el.nodePopup.classList.add('hidden');
+    }
+  });
+
+  el.nodePopup.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (event.target.closest('[data-start-from-node]') && state.popupNodeId) {
+      el.originSelect.value = state.popupNodeId;
+      injectTask();
     }
   });
 

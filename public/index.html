@@ -25,6 +25,7 @@
             <div><span id="avgUtil">--</span><label>平均负载</label></div>
             <div><span id="runningTasks">--</span><label>运行任务</label></div>
           </div>
+          <div id="nodeTypeBreakdown" class="type-breakdown">云 -- · 边 -- · 端 --</div>
         </section>
 
         <section class="panel controls-panel">
@@ -45,6 +46,13 @@
             <label for="dataInput">数据量</label>
             <input id="dataInput" type="number" min="20" max="1800" step="20" value="520" />
           </div>
+          <div class="form-row">
+            <label for="splitStrategy">拆分策略</label>
+            <select id="splitStrategy">
+              <option value="equal">默认均分</option>
+              <option value="resourceWeighted">资源权重</option>
+            </select>
+          </div>
           <div class="segmented" role="group" aria-label="priority">
             <button class="active" data-priority="中">中</button>
             <button data-priority="高">高</button>
@@ -55,10 +63,9 @@
 
         <section class="panel legend-panel">
           <div class="panel-title">节点类型</div>
-          <div class="legend-item"><i style="background:#f6c453"></i><span>核心算力</span></div>
+          <div class="legend-item"><i style="background:#f6c453"></i><span>云节点</span></div>
           <div class="legend-item"><i style="background:#41d6a6"></i><span>边缘节点</span></div>
-          <div class="legend-item"><i style="background:#70a7ff"></i><span>接入节点</span></div>
-          <div class="legend-item"><i style="background:#f17f8a"></i><span>中继节点</span></div>
+          <div class="legend-item"><i style="background:#70a7ff"></i><span>终端节点</span></div>
         </section>
       </aside>
 
@@ -79,6 +86,7 @@
         <section id="topologyView" class="view active">
           <canvas id="networkCanvas" aria-label="network topology"></canvas>
           <div id="hoverTip" class="hover-tip hidden"></div>
+          <div id="nodePopup" class="node-popup hidden"></div>
         </section>
 
         <section id="linksView" class="view table-view">
@@ -88,6 +96,7 @@
                 <tr>
                   <th>链路</th>
                   <th>端点</th>
+                  <th>角色</th>
                   <th>带宽 Mbps</th>
                   <th>时延 ms</th>
                   <th>丢包 %</th>

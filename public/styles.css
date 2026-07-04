@@ -143,6 +143,16 @@ h1 {
   font-size: 12px;
 }
 
+.type-breakdown {
+  margin-top: 10px;
+  padding: 8px 10px;
+  color: #cbd6d5;
+  background: #0d151a;
+  border: 1px solid #26343d;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
 .form-row {
   display: grid;
   gap: 6px;
@@ -301,6 +311,77 @@ input:focus {
   border-radius: 8px;
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.4);
   font-size: 12px;
+}
+
+.node-popup {
+  position: absolute;
+  width: 276px;
+  padding: 12px;
+  color: var(--text);
+  background: rgba(13, 21, 26, 0.96);
+  border: 1px solid #49606b;
+  border-radius: 8px;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.48), 0 0 24px rgba(65, 214, 166, 0.18);
+  font-size: 12px;
+}
+
+.node-popup header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.node-popup b {
+  display: block;
+  color: #f4fbfa;
+}
+
+.node-popup span,
+.node-popup em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.node-popup header button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  color: var(--text);
+  background: #101920;
+  border: 1px solid #33444e;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.popup-grid {
+  display: grid;
+  gap: 7px;
+}
+
+.popup-grid span {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.popup-grid em {
+  color: #dce5e4;
+  text-align: right;
+}
+
+.popup-action {
+  width: 100%;
+  height: 34px;
+  margin-top: 12px;
+  color: #06100e;
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  font-weight: 800;
+  cursor: pointer;
 }
 
 .hidden {

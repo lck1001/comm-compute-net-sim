@@ -11,12 +11,12 @@ const NODE_COUNT = 200;
 const TICK_MS = 900;
 const TASK_INTERVAL_MS = 6800;
 const MAX_TASKS = 36;
+const EDGE_COUNT = Math.min(NODE_COUNT - 1, Math.max(10, Math.ceil(NODE_COUNT / 3)));
 
 const nodeTypes = [
-  { type: 'Core', label: '核心算力', compute: [760, 1080], storage: [850, 1350], color: '#f6c453' },
-  { type: 'Edge', label: '边缘节点', compute: [320, 680], storage: [360, 920], color: '#41d6a6' },
-  { type: 'Access', label: '接入节点', compute: [120, 360], storage: [180, 520], color: '#70a7ff' },
-  { type: 'Relay', label: '中继节点', compute: [160, 440], storage: [220, 620], color: '#f17f8a' }
+  { type: 'Cloud', label: '云节点', compute: [1800, 2400], storage: [2200, 3200], color: '#f6c453' },
+  { type: 'Edge', label: '边缘节点', compute: [520, 980], storage: [640, 1280], color: '#41d6a6' },
+  { type: 'Terminal', label: '终端节点', compute: [100, 360], storage: [120, 520], color: '#70a7ff' }
 ];
 
 const mime = new Map([
@@ -65,9 +65,9 @@ function createNodes() {
   ];
 
   for (let i = 0; i < NODE_COUNT; i += 1) {
-    const typeInfo = i < 12 ? nodeTypes[0] : i < 74 ? nodeTypes[1] : i < 156 ? nodeTypes[2] : nodeTypes[3];
-    const zone = choose(zones);
-    const radius = typeInfo.type === 'Core' ? 0.08 : 0.16;
+    const typeInfo = i === 0 ? nodeTypes[0] : i <= EDGE_COUNT ? nodeTypes[1] : nodeTypes[2];
+    const zone = typeInfo.type === 'Cloud' ? zones[4] : choose(zones);
+    const radius = typeInfo.type === 'Cloud' ? 0.02 : typeInfo.type === 'Edge' ? 0.1 : 0.17;
     const angle = between(0, Math.PI * 2);
     const spread = Math.sqrt(random()) * radius;
     const computeTotal = Math.round(between(typeInfo.compute[0], typeInfo.compute[1]));
@@ -79,8 +79,8 @@ function createNodes() {
       type: typeInfo.type,
       label: typeInfo.label,
       zone: zone.id,
-      x: clamp(zone.cx + Math.cos(angle) * spread + between(-0.018, 0.018), 0.04, 0.96),
-      y: clamp(zone.cy + Math.sin(angle) * spread + between(-0.018, 0.018), 0.06, 0.94),
+      x: typeInfo.type === 'Cloud' ? 0.51 : clamp(zone.cx + Math.cos(angle) * spread + between(-0.018, 0.018), 0.04, 0.96),
+      y: typeInfo.type === 'Cloud' ? 0.48 : clamp(zone.cy + Math.sin(angle) * spread + between(-0.018, 0.018), 0.06, 0.94),
       computeTotal,
       storageTotal,
       computeFree: Math.round(computeTotal * between(0.58, 0.96)),
@@ -105,9 +105,23 @@ function linkKey(a, b) {
   return [a.id, b.id].sort().join('-');
 }
 
+function typeRank(type) {
+  return type === 'Cloud' ? 3 : type === 'Edge' ? 2 : 1;
+}
+
+function linkRole(a, b, fallback = 'flex') {
+  const types = [a.type, b.type].sort().join('-');
+  if (types === 'Cloud-Edge') return 'edge-cloud';
+  if (types === 'Edge-Terminal') return 'terminal-edge';
+  if (types === 'Edge-Edge') return 'edge-mesh';
+  if (types === 'Terminal-Terminal') return 'terminal-peer';
+  if (types === 'Cloud-Terminal') return 'terminal-cloud-exception';
+  return fallback;
+}
+
 function createLinks() {
   const existing = new Set();
-  const addLink = (a, b, qualityBias = 1) => {
+  const addLink = (a, b, qualityBias = 1, role = null) => {
     if (a.id === b.id) return;
     const key = linkKey(a, b);
     if (existing.has(key)) return;
@@ -122,24 +136,43 @@ function createLinks() {
       latency: Math.round(between(4, 38) / qualityBias + d * 70),
       loss: Number(between(0.1, 2.8 / qualityBias).toFixed(2)),
       utilization: Number(between(0.06, 0.52).toFixed(2)),
+      role: role || linkRole(a, b),
       active: random() > 0.045,
       changedAt: Date.now()
     });
   };
 
-  for (const node of nodes) {
-    const neighbors = nodes
-      .filter((candidate) => candidate.id !== node.id)
-      .map((candidate) => ({ candidate, d: distance(node, candidate) }))
-      .sort((left, right) => left.d - right.d)
-      .slice(0, node.type === 'Core' ? 8 : 5);
+  const cloud = nodes.find((node) => node.type === 'Cloud');
+  const edgeNodes = nodes.filter((node) => node.type === 'Edge');
+  const terminalNodes = nodes.filter((node) => node.type === 'Terminal');
 
-    for (const neighbor of neighbors) addLink(node, neighbor.candidate, node.type === 'Core' || neighbor.candidate.type === 'Core' ? 1.22 : 1);
+  for (const edge of edgeNodes) addLink(edge, cloud, 1.55, 'edge-cloud');
+
+  for (let i = 0; i < edgeNodes.length; i += 1) {
+    addLink(edgeNodes[i], edgeNodes[(i + 1) % edgeNodes.length], 1.32, 'edge-mesh');
+    if (i % 3 === 0) addLink(edgeNodes[i], edgeNodes[(i + 5) % edgeNodes.length], 1.22, 'edge-mesh');
   }
 
-  for (let i = 0; i < 42; i += 1) {
-    const coreOrEdge = nodes.filter((node) => node.type === 'Core' || node.type === 'Edge');
-    addLink(choose(coreOrEdge), choose(coreOrEdge), 1.36);
+  for (const terminal of terminalNodes) {
+    const nearestEdges = edgeNodes
+      .map((edge) => ({ edge, d: distance(terminal, edge), sameZone: edge.zone === terminal.zone }))
+      .sort((left, right) => Number(right.sameZone) - Number(left.sameZone) || left.d - right.d)
+      .slice(0, random() > 0.28 ? 2 : 3);
+    for (const item of nearestEdges) addLink(terminal, item.edge, item.sameZone ? 1.18 : 1.04, 'terminal-edge');
+
+    if (random() < 0.34) {
+      const peer = terminalNodes
+        .filter((node) => node.id !== terminal.id && node.zone === terminal.zone)
+        .map((node) => ({ node, d: distance(terminal, node) }))
+        .sort((left, right) => left.d - right.d)[0]?.node;
+      if (peer) addLink(terminal, peer, 0.72, 'terminal-peer');
+    }
+
+    if (random() < 0.025) addLink(terminal, cloud, 0.7, 'terminal-cloud-exception');
+  }
+
+  for (let i = 0; i < Math.ceil(EDGE_COUNT * 0.35); i += 1) {
+    addLink(choose(edgeNodes), choose(edgeNodes), 1.28, 'edge-mesh');
   }
 }
 
@@ -161,14 +194,36 @@ function neighborMap() {
   return map;
 }
 
+function pathPolicyScore(pathIds) {
+  if (!pathIds || pathIds.length < 2) return 0.6;
+  const pathNodes = pathIds.map(getNode).filter(Boolean);
+  if (pathNodes.length !== pathIds.length) return 0;
+  const ranks = pathNodes.map((node) => typeRank(node.type));
+  const layered = ranks.every((rank, index) => index === 0 || rank >= ranks[index - 1]);
+  const reverseLayered = ranks.every((rank, index) => index === 0 || rank <= ranks[index - 1]);
+  const hasEdgeBridge = pathNodes.some((node) => node.type === 'Edge');
+  const terminalCloudDirect = pathNodes.length === 2 && pathNodes.some((node) => node.type === 'Terminal') && pathNodes.some((node) => node.type === 'Cloud');
+  let score = 0.52;
+  if (layered || reverseLayered) score += 0.32;
+  if (hasEdgeBridge) score += 0.18;
+  if (terminalCloudDirect) score -= 0.28;
+  if (pathNodes.length === 3 && pathNodes[1].type === 'Edge') score += 0.18;
+  return clamp(score, 0.18, 1.24);
+}
+
 function findPathWithinTwoHops(originId, targetId) {
   if (originId === targetId) return [originId];
   const map = neighborMap();
-  if (map.get(originId)?.has(targetId)) return [originId, targetId];
+  const paths = [];
+  if (map.get(originId)?.has(targetId)) paths.push([originId, targetId]);
   for (const mid of map.get(originId) || []) {
-    if (map.get(mid)?.has(targetId)) return [originId, mid, targetId];
+    if (map.get(mid)?.has(targetId)) paths.push([originId, mid, targetId]);
   }
-  return null;
+  if (!paths.length) return null;
+  return paths
+    .map((path) => ({ path, metrics: pathMetrics(path), policy: pathPolicyScore(path) }))
+    .filter((item) => item.metrics)
+    .sort((left, right) => (right.policy + right.metrics.score * 0.35) - (left.policy + left.metrics.score * 0.35))[0]?.path || null;
 }
 
 function linkBetween(a, b) {
@@ -202,17 +257,26 @@ function twoHopCandidates(originId, demand) {
       if (!metrics) return null;
       const resourceScore = node.computeFree / Math.max(1, node.computeTotal) + node.storageFree / Math.max(1, node.storageTotal);
       const canHold = node.computeFree >= demand.compute * 0.08 && node.storageFree >= demand.storage * 0.06;
+      const commScore = clamp(metrics.bottleneck / 900, 0, 1.5);
+      const policyScore = pathPolicyScore(path);
       return {
         node,
         path,
         metrics,
-        score: resourceScore * 1.7 + metrics.score + (node.type === 'Core' ? 0.22 : 0),
+        score: resourceScore * 1.45 + commScore * 1.65 + metrics.score * 0.62 + policyScore + (node.type === 'Cloud' ? 0.18 : 0),
         canHold
       };
     })
     .filter(Boolean)
     .filter((candidate) => candidate.canHold)
     .sort((left, right) => right.score - left.score);
+}
+
+function splitWeight(candidate) {
+  const computeRatio = candidate.node.computeFree / Math.max(1, candidate.node.computeTotal);
+  const storageRatio = candidate.node.storageFree / Math.max(1, candidate.node.storageTotal);
+  const commRatio = clamp(candidate.metrics.bottleneck / 900, 0.05, 1.6);
+  return Math.max(0.05, computeRatio * 0.42 + storageRatio * 0.28 + commRatio * 0.3);
 }
 
 function createTask(payload = {}) {
@@ -224,15 +288,27 @@ function createTask(payload = {}) {
     data: Number(payload.data || Math.round(between(180, 920)))
   };
   const priority = payload.priority || choose(['低', '中', '高', '紧急']);
+  const splitStrategy = payload.splitStrategy || 'equal';
   const candidates = twoHopCandidates(origin.id, demand).slice(0, 12);
   let remainingCompute = demand.compute;
   let remainingStorage = demand.storage;
   const fragments = [];
+  const selected = candidates.slice(0, Math.min(candidates.length, Number(payload.fragmentCount || 6)));
 
-  for (const candidate of candidates) {
+  for (let index = 0; index < selected.length; index += 1) {
+    const candidate = selected[index];
     if (remainingCompute <= 0 || remainingStorage <= 0) break;
-    const computeSlice = Math.min(Math.round(demand.compute * between(0.14, 0.34)), candidate.node.computeFree, remainingCompute);
-    const storageSlice = Math.min(Math.round(demand.storage * between(0.12, 0.31)), candidate.node.storageFree, remainingStorage);
+    const isLast = index === selected.length - 1;
+    const remainingSlots = Math.max(1, selected.length - index);
+    const remainingCandidates = selected.slice(index);
+    const remainingWeight = remainingCandidates.reduce((sum, item) => sum + splitWeight(item), 0);
+    const weightShare = remainingWeight > 0 ? splitWeight(candidate) / remainingWeight : 1 / remainingSlots;
+    const weightedCompute = Math.round(remainingCompute * weightShare);
+    const weightedStorage = Math.round(remainingStorage * weightShare);
+    const targetCompute = splitStrategy === 'equal' ? (isLast ? remainingCompute : Math.round(remainingCompute / remainingSlots)) : weightedCompute;
+    const targetStorage = splitStrategy === 'equal' ? (isLast ? remainingStorage : Math.round(remainingStorage / remainingSlots)) : weightedStorage;
+    const computeSlice = Math.min(targetCompute, candidate.node.computeFree, remainingCompute);
+    const storageSlice = Math.min(targetStorage, candidate.node.storageFree, remainingStorage);
     if (computeSlice < 24 || storageSlice < 10) continue;
     candidate.node.computeFree -= computeSlice;
     candidate.node.storageFree -= storageSlice;
@@ -260,6 +336,7 @@ function createTask(payload = {}) {
     origin: origin.id,
     demand,
     priority,
+    splitStrategy,
     status: accepted ? 'dispatching' : 'rejected',
     accepted,
     remaining: { compute: Math.max(0, remainingCompute), storage: Math.max(0, remainingStorage) },
@@ -268,6 +345,7 @@ function createTask(payload = {}) {
     message: accepted ? '2-hop elastic scheduling accepted' : 'insufficient resource/link quality within 2 hops'
   };
 
+  if (!accepted) releaseTaskResources(task);
   tasks.unshift(task);
   while (tasks.length > MAX_TASKS) tasks.pop();
   return task;
@@ -303,7 +381,7 @@ function simulateNodes() {
     node.rxMbps = 0;
     node.pulse = (node.pulse + between(0.025, 0.075)) % 1;
     node.load = clamp(1 - node.computeFree / node.computeTotal + between(-0.015, 0.02), 0.02, 0.98);
-    if (random() < 0.004 && node.type !== 'Core') node.status = node.status === 'online' ? 'degraded' : 'online';
+    if (random() < 0.004 && node.type !== 'Cloud') node.status = node.status === 'online' ? 'degraded' : 'online';
     if (node.status === 'degraded' && random() < 0.12) node.status = 'online';
     const idleRecover = node.status === 'online' ? between(1, 7) : between(0, 2);
     node.computeFree = Math.min(node.computeTotal, Math.round(node.computeFree + idleRecover));
@@ -344,6 +422,10 @@ function snapshot() {
   const activeLinks = links.filter((link) => link.active).length;
   const avgUtil = links.reduce((sum, link) => sum + link.utilization, 0) / links.length;
   const runningTasks = tasks.filter((task) => ['dispatching', 'running'].includes(task.status)).length;
+  const nodeTypes = nodes.reduce((counts, node) => {
+    counts[node.type] = (counts[node.type] || 0) + 1;
+    return counts;
+  }, {});
 
   return {
     tick: tickCount,
@@ -354,6 +436,8 @@ function snapshot() {
       activeLinks,
       totalLinks: links.length,
       avgUtilization: Number(avgUtil.toFixed(2)),
+      nodeTypes,
+      edgeLimit: EDGE_COUNT,
       runningTasks,
       completeTasks: tasks.filter((task) => task.status === 'complete').length,
       rejectedTasks: tasks.filter((task) => task.status === 'rejected').length
