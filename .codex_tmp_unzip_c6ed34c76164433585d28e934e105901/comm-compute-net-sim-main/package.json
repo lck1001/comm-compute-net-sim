@@ -1,0 +1,16 @@
+﻿{
+  "name": "comm-compute-net-sim",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight communication-computing network simulator with dynamic topology, 2-hop elastic scheduling, and live visualization.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {}
+}
