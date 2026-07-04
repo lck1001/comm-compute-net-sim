@@ -33,7 +33,7 @@
         <section class="panel controls-panel task-panel-fill">
           <div class="panel-title">任务注入</div>
           <div class="form-row">
-            <label class="sr-only">发起节点</label>
+            <label class="sr-only" for="originSelect">发起节点</label>
             <select id="originSelect"></select>
           </div>
           <div class="form-row">
@@ -67,7 +67,6 @@
           <button id="injectTask" class="primary-button">注入任务</button>
           <div id="injectStatus" class="inject-status hidden"></div>
         </section>
-
       </aside>
 
       <section class="stage">
@@ -75,7 +74,7 @@
           <div class="tabs" role="tablist">
             <button class="active" data-view="topology">动态拓扑</button>
             <button data-view="links">链路详情</button>
-            <button data-view="trace">逐节点传输</button>
+            <button data-view="trace">回传追踪</button>
           </div>
           <div class="topbar-legend">
             <span class="legend-dot" style="background:#f6c453"></span>云
@@ -124,7 +123,7 @@
               </div>
               <div id="traceStatus" class="trace-status">等待调度</div>
             </div>
-            <canvas id="traceCanvas" aria-label="task trace"></canvas>
+            <canvas id="traceCanvas" aria-label="packet trace"></canvas>
             <div id="fragmentList" class="fragment-list"></div>
           </div>
         </section>

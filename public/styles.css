@@ -678,6 +678,22 @@ td {
   background: linear-gradient(90deg, var(--accent), var(--accent-2));
 }
 
+.packet-card {
+  border-color: color-mix(in srgb, var(--accent) 58%, #26343d 42%);
+}
+
+.packet-card.downlink {
+  border-color: color-mix(in srgb, var(--warn) 58%, #26343d 42%);
+}
+
+.packet-progress.uplink i {
+  background: linear-gradient(90deg, var(--accent), #dffdf2);
+}
+
+.packet-progress.downlink i {
+  background: linear-gradient(90deg, var(--warn), #ffffff);
+}
+
 .meta-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

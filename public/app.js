@@ -2,6 +2,7 @@
   nodes: [],
   links: [],
   tasks: [],
+  packetJourneys: [],
   summary: {},
   selectedTaskId: null,
   selectedNodeId: null,
@@ -86,6 +87,30 @@ function selectedTask() {
   return state.tasks.find((task) => task.id === state.selectedTaskId) || state.tasks[0] || null;
 }
 
+function taskPackets(task) {
+  if (!task) return [];
+  if (Array.isArray(task.packetJourneys) && task.packetJourneys.length) return task.packetJourneys;
+  const ids = new Set(task.packetIds || []);
+  return state.packetJourneys.filter((packet) => ids.has(packet.id) || packet.taskId === task.id);
+}
+
+function directionLabel(direction) {
+  return direction === 'downlink' ? '下行控制' : '上行回传';
+}
+
+function directionColor(direction) {
+  return direction === 'downlink' ? '#f6c453' : '#41d6a6';
+}
+
+function packetStatusLabel(status) {
+  const labels = {
+    waiting: '等待下发',
+    transmitting: '传输中',
+    complete: '已送达'
+  };
+  return labels[status] || status || '--';
+}
+
 function nodeById(id) {
   return state.nodes.find((node) => node.id === id);
 }
@@ -143,12 +168,14 @@ function renderTaskList() {
     .map((task) => {
       const statusClass = task.status === 'rejected' ? 'rejected' : task.status === 'complete' ? 'complete' : '';
       const progress = task.progress || 0;
+      const packets = taskPackets(task);
       return `<article class="task-card ${task.id === state.selectedTaskId ? 'active' : ''}" data-task="${task.id}">
         <header><span>${task.id} · ${task.priority}</span><span class="status-pill ${statusClass}">${task.status}</span></header>
         <div class="progress"><i style="width:${Math.round(progress * 100)}%"></i></div>
         <div class="meta-row">
           <span>源 ${task.origin}</span>
           <span>${task.fragments.length} 片</span>
+          <span>${packets.length} 条回传</span>
           <span>${splitLabel(task.splitStrategy)}</span>
           <span>算力 ${fmt(task.demand.compute)}</span>
           <span>数据 ${fmt(task.demand.data)} MB</span>
@@ -239,7 +266,23 @@ function renderFragments(task) {
     el.fragmentList.innerHTML = '';
     return;
   }
-  el.fragmentList.innerHTML = task.fragments
+  const packets = taskPackets(task);
+  const packetCards = packets
+    .map((packet) => `<article class="fragment-card packet-card ${packet.direction}">
+      <header>
+        <span>${packet.id} · ${packet.label || directionLabel(packet.direction)}</span>
+        <span>${packetStatusLabel(packet.status)} · ${Math.round((packet.progress || 0) * 100)}%</span>
+      </header>
+      <div class="progress packet-progress ${packet.direction}"><i style="width:${Math.round((packet.progress || 0) * 100)}%"></i></div>
+      <div class="meta-row">
+        <span>${directionLabel(packet.direction)}</span>
+        <span>${packet.path.join(' → ')}</span>
+        <span>${fmt(packet.data)} MB</span>
+        <span>${fmt(packet.latency)} ms / ${fmt(packet.bottleneck)} Mbps</span>
+      </div>
+    </article>`)
+    .join('');
+  const fragmentCards = task.fragments
     .map((fragment) => `<article class="fragment-card">
       <header><span>${fragment.id} → ${fragment.nodeId}</span><span>${Math.round((fragment.progress || 0) * 100)}%</span></header>
       <div class="progress"><i style="width:${Math.round((fragment.progress || 0) * 100)}%"></i></div>
@@ -251,6 +294,7 @@ function renderFragments(task) {
       </div>
     </article>`)
     .join('');
+  el.fragmentList.innerHTML = `${packetCards}${fragmentCards}`;
 }
 
 function nodeHitRadius(node) {
@@ -414,6 +458,49 @@ function drawTopology(time = 0) {
   }
 
   const task = selectedTask();
+  const packets = taskPackets(task);
+  if (packets.length) {
+    ctx.save();
+    for (const packet of packets) {
+      const path = packet.path || [];
+      const hopCount = Math.max(1, path.length - 1);
+      const color = directionColor(packet.direction);
+      for (let i = 0; i < path.length - 1; i += 1) {
+        const a = state.nodeScreen.get(path[i]);
+        const b = state.nodeScreen.get(path[i + 1]);
+        if (!a || !b) continue;
+        ctx.globalAlpha = packet.direction === 'uplink' ? 0.72 : 0.62;
+        ctx.strokeStyle = color;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = packet.status === 'complete' ? 4 : 12;
+        ctx.lineWidth = packet.direction === 'uplink' ? 3.2 : 2.5;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+      if (path.length > 1 && packet.status !== 'waiting') {
+        const scaled = (packet.progress || 0) * hopCount;
+        const hop = Math.min(hopCount - 1, Math.floor(scaled));
+        const local = Math.min(1, scaled - hop);
+        const a = state.nodeScreen.get(path[hop]);
+        const b = state.nodeScreen.get(path[hop + 1]);
+        if (a && b) {
+          const px = a.x + (b.x - a.x) * local;
+          const py = a.y + (b.y - a.y) * local;
+          ctx.globalAlpha = 0.95;
+          ctx.fillStyle = color;
+          ctx.shadowColor = color;
+          ctx.shadowBlur = 16;
+          ctx.beginPath();
+          ctx.arc(px, py, packet.direction === 'uplink' ? 4.5 : 3.8, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+  }
+
   if (task?.fragments?.length) {
     ctx.save();
     for (const fragment of task.fragments) {
@@ -485,7 +572,12 @@ function renderTrace() {
   el.traceStatus.textContent = task.status;
   renderFragments(task);
 
-  const lanes = Math.max(1, Math.min(task.fragments.length, 8));
+  const packets = taskPackets(task);
+  const streams = [
+    ...packets.map((packet) => ({ type: 'packet', item: packet })),
+    ...(task.fragments || []).map((fragment) => ({ type: 'fragment', item: fragment }))
+  ].slice(0, 8);
+  const lanes = Math.max(1, streams.length);
   const top = 48;
   const bottom = rect.height - 42;
   const left = 70;
@@ -493,34 +585,41 @@ function renderTrace() {
   traceCtx.lineWidth = 1;
   traceCtx.font = '12px Segoe UI, sans-serif';
 
-  task.fragments.slice(0, 8).forEach((fragment, index) => {
+  streams.forEach((stream, index) => {
+    const item = stream.item;
+    const path = item.path || [];
     const y = top + (bottom - top) * (index + 0.5) / lanes;
-    const steps = fragment.path.length;
-    traceCtx.strokeStyle = 'rgba(112, 167, 255, 0.35)';
+    const steps = path.length;
+    const color = stream.type === 'packet' ? directionColor(item.direction) : 'rgba(112, 167, 255, 0.9)';
+    traceCtx.strokeStyle = stream.type === 'packet' ? `${color}aa` : 'rgba(112, 167, 255, 0.35)';
     traceCtx.beginPath();
     traceCtx.moveTo(left, y);
     traceCtx.lineTo(right, y);
     traceCtx.stroke();
 
-    fragment.path.forEach((nodeId, hop) => {
+    path.forEach((nodeId, hop) => {
       const x = steps === 1 ? left : left + (right - left) * hop / (steps - 1);
       const node = nodeById(nodeId);
       traceCtx.fillStyle = node?.color || '#cfd9d8';
       traceCtx.beginPath();
-      traceCtx.arc(x, y, hop === 0 ? 7 : 6, 0, Math.PI * 2);
+      traceCtx.arc(x, y, stream.type === 'packet' ? 7 : 6, 0, Math.PI * 2);
       traceCtx.fill();
       traceCtx.fillStyle = '#cbd6d5';
       traceCtx.fillText(nodeId, x - 18, y - 14);
     });
 
-    const p = fragment.progress || 0;
+    const p = item.progress || 0;
     const packetX = left + (right - left) * p;
-    traceCtx.fillStyle = '#ffffff';
+    traceCtx.fillStyle = stream.type === 'packet' ? color : '#ffffff';
+    traceCtx.shadowColor = stream.type === 'packet' ? color : 'transparent';
+    traceCtx.shadowBlur = stream.type === 'packet' ? 10 : 0;
     traceCtx.beginPath();
-    traceCtx.arc(packetX, y, 4, 0, Math.PI * 2);
+    traceCtx.arc(packetX, y, stream.type === 'packet' ? 5 : 4, 0, Math.PI * 2);
     traceCtx.fill();
+    traceCtx.shadowBlur = 0;
     traceCtx.fillStyle = '#98a7a6';
-    traceCtx.fillText(fragment.id, 12, y + 4);
+    const label = stream.type === 'packet' ? `${item.id} ${directionLabel(item.direction)}` : item.id;
+    traceCtx.fillText(label, 12, y + 4);
   });
 }
 
@@ -560,6 +659,7 @@ function applyState(payload) {
   state.nodes = newNodes;
   state.links = payload.links || [];
   state.tasks = payload.tasks || [];
+  state.packetJourneys = payload.packetJourneys || [];
   state.summary = payload.summary || {};
   state.tick = payload.tick || 0;
   state.paused = payload.paused || false;

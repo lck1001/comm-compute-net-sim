@@ -11,6 +11,7 @@ let NODE_COUNT = Number(process.env.NODE_COUNT || 200);
 const TICK_MS = 900;
 const TASK_INTERVAL_MS = 6800;
 const MAX_TASKS = 36;
+const MAX_PACKET_JOURNEYS = 96;
 
 function defaultEdgeCount(total) {
   return Math.min(total - 1, Math.max(10, Math.ceil(total / 3)));
@@ -42,7 +43,10 @@ const clients = new Set();
 const nodes = [];
 const links = [];
 const tasks = [];
+const packetJourneys = [];
 let nextTaskId = 1;
+let nextLinkId = 1;
+let nextPacketId = 1;
 let lastAutoTaskAt = 0;
 let tickCount = 0;
 let paused = false;
@@ -128,16 +132,61 @@ function linkRole(a, b, fallback = 'flex') {
   return fallback;
 }
 
-// Dynamic link creation — links are only materialized when data actually flows
-function ensureLink(aId, bId) {
+function linkProfile(role, d) {
+  const profiles = {
+    'edge-cloud': {
+      bandwidth: [1300, 2400],
+      latency: [8, 22],
+      loss: [0.02, 0.32],
+      utilization: [0.06, 0.24],
+      distanceFactor: 28
+    },
+    'terminal-edge': {
+      bandwidth: [320, 980],
+      latency: [5, 28],
+      loss: [0.05, 1.4],
+      utilization: [0.08, 0.36],
+      distanceFactor: 46
+    },
+    'edge-mesh': {
+      bandwidth: [650, 1600],
+      latency: [6, 26],
+      loss: [0.04, 0.8],
+      utilization: [0.06, 0.3],
+      distanceFactor: 34
+    },
+    'terminal-peer': {
+      bandwidth: [120, 420],
+      latency: [8, 44],
+      loss: [0.2, 2.8],
+      utilization: [0.06, 0.42],
+      distanceFactor: 58
+    },
+    flex: {
+      bandwidth: [160, 900],
+      latency: [4, 38],
+      loss: [0.1, 2.8],
+      utilization: [0.06, 0.52],
+      distanceFactor: 70
+    }
+  };
+  const profile = profiles[role] || profiles.flex;
+  return {
+    bandwidth: Math.round(between(profile.bandwidth[0], profile.bandwidth[1])),
+    latency: Math.round(between(profile.latency[0], profile.latency[1]) + d * profile.distanceFactor),
+    loss: Number(between(profile.loss[0], profile.loss[1]).toFixed(2)),
+    utilization: Number(between(profile.utilization[0], profile.utilization[1]).toFixed(2))
+  };
+}
+
+function createPhysicalLink(aId, bId, options = {}) {
   const key = linkKey({ id: aId }, { id: bId });
   let link = links.find((l) => linkKey({ id: l.a }, { id: l.b }) === key);
   if (link) {
-    // Reactivate if it was idle
-    if (!link.active) {
-      link.active = true;
-      link.changedAt = Date.now();
-    }
+    if (options.persistent) link.persistent = true;
+    if (options.role) link.role = options.role;
+    if (options.active !== false && !link.active) link.changedAt = Date.now();
+    if (options.active !== false) link.active = true;
     link.lastUsedAt = Date.now();
     return link;
   }
@@ -145,23 +194,90 @@ function ensureLink(aId, bId) {
   const nodeB = getNode(bId);
   if (!nodeA || !nodeB) return null;
   const d = distance(nodeA, nodeB);
-  if (d > LINK_RADIUS) return null;
+  if (!options.force && d > LINK_RADIUS) return null;
+  const role = options.role || linkRole(nodeA, nodeB);
+  const metrics = linkProfile(role, d);
   link = {
-    id: `L${String(links.length + 1).padStart(4, '0')}`,
+    id: `L${String(nextLinkId++).padStart(4, '0')}`,
     a: aId,
     b: bId,
     distance: Number((d * 1000).toFixed(1)),
-    bandwidth: Math.round(between(160, 900)),
-    latency: Math.round(between(4, 38) + d * 70),
-    loss: Number(between(0.1, 2.8).toFixed(2)),
-    utilization: Number(between(0.06, 0.52).toFixed(2)),
-    role: linkRole(nodeA, nodeB),
-    active: true,
+    ...metrics,
+    role,
+    active: options.active !== false,
+    persistent: Boolean(options.persistent),
     lastUsedAt: Date.now(),
     changedAt: Date.now()
   };
   links.push(link);
   return link;
+}
+
+// Dynamic link creation. Non-persistent links are only materialized when data flows.
+function ensureLink(aId, bId) {
+  return createPhysicalLink(aId, bId, { active: true });
+}
+
+function nearestNodes(source, candidates, limit, options = {}) {
+  return [...candidates]
+    .filter((node) => node.id !== source.id)
+    .map((node) => {
+      const sameZoneBonus = options.sameZoneBonus && node.zone === source.zone ? options.sameZoneBonus : 1;
+      const typeBias = options.typeBias?.[node.type] || 1;
+      return { node, score: distance(source, node) * sameZoneBonus * typeBias };
+    })
+    .sort((left, right) => left.score - right.score)
+    .slice(0, limit)
+    .map((item) => item.node);
+}
+
+function createStableTopology() {
+  const cloud = nodes.find((node) => node.type === 'Cloud');
+  const edges = nodes.filter((node) => node.type === 'Edge');
+  const terminals = nodes.filter((node) => node.type === 'Terminal');
+  if (!cloud || !edges.length) return;
+
+  for (const edge of edges) {
+    createPhysicalLink(edge.id, cloud.id, {
+      role: 'edge-cloud',
+      persistent: true,
+      active: true,
+      force: true
+    });
+    const meshPeers = nearestNodes(edge, edges, edges.length <= 20 ? 3 : 2, { sameZoneBonus: 0.62 });
+    for (const peer of meshPeers) {
+      createPhysicalLink(edge.id, peer.id, {
+        role: 'edge-mesh',
+        persistent: true,
+        active: true,
+        force: true
+      });
+    }
+  }
+
+  for (const terminal of terminals) {
+    const gateways = nearestNodes(terminal, edges, 2, { sameZoneBonus: 0.42 });
+    terminal.gatewayEdgeId = gateways[0]?.id || edges[0].id;
+    terminal.backupEdgeId = gateways[1]?.id || terminal.gatewayEdgeId;
+    for (const gateway of gateways) {
+      createPhysicalLink(terminal.id, gateway.id, {
+        role: 'terminal-edge',
+        persistent: true,
+        active: true,
+        force: true
+      });
+    }
+
+    const peers = nearestNodes(terminal, terminals.filter((node) => node.zone === terminal.zone), 1);
+    for (const peer of peers) {
+      createPhysicalLink(terminal.id, peer.id, {
+        role: 'terminal-peer',
+        persistent: false,
+        active: false,
+        force: true
+      });
+    }
+  }
 }
 
 function applyForceLayout() {
@@ -324,6 +440,117 @@ function pathMetrics(pathIds) {
   return { bottleneck, latency, loss, utilization, score };
 }
 
+function activeLinkBetween(a, b, role) {
+  return links.find((link) => {
+    const samePair = (link.a === a && link.b === b) || (link.a === b && link.b === a);
+    return samePair && link.active && (!role || link.role === role);
+  }) || null;
+}
+
+function bestGatewayForTerminal(terminal) {
+  const gateways = [terminal.gatewayEdgeId, terminal.backupEdgeId]
+    .filter(Boolean)
+    .map(getNode)
+    .filter((node) => node && node.status === 'online');
+  const candidates = gateways.length
+    ? gateways
+    : nodes.filter((node) => node.type === 'Edge' && node.status === 'online');
+
+  return candidates
+    .map((edge) => {
+      const access = activeLinkBetween(terminal.id, edge.id, 'terminal-edge') || linkBetween(terminal.id, edge.id);
+      const backhaul = activeLinkBetween(edge.id, 'N001', 'edge-cloud') || linkBetween(edge.id, 'N001');
+      if (!access || !backhaul) return null;
+      const residual = Math.min(access.bandwidth * (1 - access.utilization), backhaul.bandwidth * (1 - backhaul.utilization));
+      const score = residual / 1200 - (access.latency + backhaul.latency) / 160 - (access.loss + backhaul.loss) / 10;
+      return { edge, score };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score)[0]?.edge || null;
+}
+
+function buildUplinkRoute(originId) {
+  const origin = getNode(originId);
+  const cloud = nodes.find((node) => node.type === 'Cloud');
+  if (!origin || !cloud) return null;
+  if (origin.type === 'Cloud') return [origin.id];
+  if (origin.type === 'Edge') return [origin.id, cloud.id];
+  const gateway = bestGatewayForTerminal(origin);
+  if (!gateway) return null;
+  return [origin.id, gateway.id, cloud.id];
+}
+
+function buildDownlinkRoute(targetId) {
+  const target = getNode(targetId);
+  const cloud = nodes.find((node) => node.type === 'Cloud');
+  if (!target || !cloud) return null;
+  if (target.type === 'Cloud') return [cloud.id];
+  if (target.type === 'Edge') return [cloud.id, target.id];
+  const uplink = buildUplinkRoute(target.id);
+  return uplink ? [...uplink].reverse() : null;
+}
+
+function createPacketJourney(options) {
+  const path = options.path?.filter(Boolean);
+  if (!path?.length) return null;
+  for (let i = 0; i < path.length - 1; i += 1) ensureLink(path[i], path[i + 1]);
+  const metrics = pathMetrics(path) || { bottleneck: 120, latency: 0, loss: 0 };
+  const journey = {
+    id: `P${String(nextPacketId++).padStart(4, '0')}`,
+    taskId: options.taskId,
+    kind: options.kind,
+    label: options.label,
+    direction: options.direction,
+    origin: path[0],
+    target: path[path.length - 1],
+    path,
+    data: Math.max(1, Math.round(options.data || 1)),
+    priority: options.priority || '中',
+    createdAt: Date.now(),
+    startAt: Date.now() + Number(options.delayMs || 0),
+    progress: 0,
+    currentHop: 0,
+    status: Number(options.delayMs || 0) > 0 ? 'waiting' : 'transmitting',
+    latency: Math.round(metrics.latency || 0),
+    bottleneck: Math.round(metrics.bottleneck || 0),
+    loss: Number((metrics.loss || 0).toFixed(2))
+  };
+  packetJourneys.unshift(journey);
+  while (packetJourneys.length > MAX_PACKET_JOURNEYS) packetJourneys.pop();
+  return journey;
+}
+
+function attachPacketJourneys(task) {
+  if (!task.accepted) return;
+  const uplink = buildUplinkRoute(task.origin);
+  const downlink = buildDownlinkRoute(task.origin);
+  const journeys = [];
+  if (uplink) {
+    journeys.push(createPacketJourney({
+      taskId: task.id,
+      kind: 'situation',
+      label: '上行态势回传',
+      direction: 'uplink',
+      path: uplink,
+      data: task.demand.data,
+      priority: task.priority
+    }));
+  }
+  if (downlink) {
+    journeys.push(createPacketJourney({
+      taskId: task.id,
+      kind: 'control',
+      label: '下行控制指令',
+      direction: 'downlink',
+      path: downlink,
+      data: Math.max(8, task.demand.data * 0.08),
+      priority: task.priority,
+      delayMs: 1200
+    }));
+  }
+  task.packetIds = journeys.filter(Boolean).map((journey) => journey.id);
+}
+
 function twoHopCandidates(originId, demand) {
   return nodes
     .map((node) => {
@@ -357,7 +584,8 @@ function splitWeight(candidate) {
 
 function createTask(payload = {}) {
   const online = nodes.filter((node) => node.status === 'online');
-  const origin = payload.origin && getNode(payload.origin) ? getNode(payload.origin) : choose(online);
+  const terminalOrigins = online.filter((node) => node.type === 'Terminal');
+  const origin = payload.origin && getNode(payload.origin) ? getNode(payload.origin) : choose(terminalOrigins.length ? terminalOrigins : online);
   const demand = {
     compute: Number(payload.compute || Math.round(between(520, 1680))),
     storage: Number(payload.storage || Math.round(between(220, 820))),
@@ -432,6 +660,7 @@ function createTask(payload = {}) {
   };
 
   if (!accepted) releaseTaskResources(task);
+  attachPacketJourneys(task);
   tasks.unshift(task);
   while (tasks.length > MAX_TASKS) tasks.pop();
   return task;
@@ -464,12 +693,16 @@ function resetSimulation(opts = {}) {
   nodes.length = 0;
   links.length = 0;
   tasks.length = 0;
+  packetJourneys.length = 0;
   nextTaskId = 1;
+  nextLinkId = 1;
+  nextPacketId = 1;
   lastAutoTaskAt = 0;
   tickCount = 0;
   paused = false;
   createNodes();
   applyForceLayout();
+  createStableTopology();
   createTask({ priority: '高' });
   broadcast('state', snapshot());
 }
@@ -478,15 +711,21 @@ function simulateLinks() {
   const now = Date.now();
   const idleThreshold = 15000; // 15s of no usage → deactivate
   for (const link of links) {
+    if (link.persistent) {
+      link.active = true;
+      link.lastUsedAt = now;
+    }
     // Only fluctuate metrics for active links (data is flowing)
     if (link.active) {
       const drift = between(-0.055, 0.065);
-      link.utilization = Number(clamp(link.utilization + drift, 0.02, 0.94).toFixed(2));
+      const floor = link.persistent ? 0.04 : 0.02;
+      const ceiling = link.persistent ? 0.88 : 0.94;
+      link.utilization = Number(clamp(link.utilization + drift, floor, ceiling).toFixed(2));
       link.latency = Math.round(clamp(link.latency + between(-3, 4), 3, 110));
       link.loss = Number(clamp(link.loss + between(-0.18, 0.2), 0.02, 8.5).toFixed(2));
     }
     // Deactivate idle links that haven't been used recently
-    if (link.active && link.lastUsedAt && now - link.lastUsedAt > idleThreshold) {
+    if (!link.persistent && link.active && link.lastUsedAt && now - link.lastUsedAt > idleThreshold) {
       link.active = false;
       link.changedAt = now;
     }
@@ -610,10 +849,48 @@ function simulateTasks() {
   }
 }
 
+function simulatePacketJourneys() {
+  const now = Date.now();
+  for (const journey of packetJourneys) {
+    if (journey.status === 'complete') continue;
+    if (now < journey.startAt) {
+      journey.status = 'waiting';
+      continue;
+    }
+    const metrics = pathMetrics(journey.path) || { bottleneck: journey.bottleneck || 120, latency: journey.latency || 20 };
+    const hopCount = Math.max(1, journey.path.length - 1);
+    const speed = clamp((metrics.bottleneck || 120) / Math.max(180, journey.data * 3.2), 0.025, 0.18);
+    journey.progress = clamp(journey.progress + speed * between(0.05, 0.11), 0, 1);
+    journey.currentHop = Math.min(hopCount - 1, Math.floor(journey.progress * hopCount));
+    journey.status = journey.progress >= 0.995 ? 'complete' : 'transmitting';
+    journey.latency = Math.round(metrics.latency || journey.latency || 0);
+    journey.bottleneck = Math.round(metrics.bottleneck || journey.bottleneck || 0);
+    journey.loss = Number((metrics.loss || journey.loss || 0).toFixed(2));
+
+    if (journey.path.length > 1 && journey.status !== 'complete') {
+      const aId = journey.path[journey.currentHop];
+      const bId = journey.path[journey.currentHop + 1];
+      const a = getNode(aId);
+      const b = getNode(bId);
+      const link = ensureLink(aId, bId);
+      const rate = Math.max(1, Math.round(journey.data * (journey.direction === 'uplink' ? 0.045 : 0.018)));
+      if (a) a.txMbps += rate;
+      if (b) b.rxMbps += rate;
+      if (link) {
+        link.utilization = Number(clamp(link.utilization + (journey.direction === 'uplink' ? 0.018 : 0.01), 0.04, 0.98).toFixed(2));
+        link.lastUsedAt = now;
+        link.active = true;
+      }
+    } else if (journey.status === 'complete' && !journey.completedAt) {
+      journey.completedAt = now;
+    }
+  }
+}
+
 function snapshot() {
   const onlineNodes = nodes.filter((node) => node.status === 'online').length;
   const activeLinks = links.filter((link) => link.active).length;
-  const avgUtil = links.reduce((sum, link) => sum + link.utilization, 0) / links.length;
+  const avgUtil = links.length ? links.reduce((sum, link) => sum + link.utilization, 0) / links.length : 0;
   const runningTasks = tasks.filter((task) => ['dispatching', 'running'].includes(task.status)).length;
   const nodeTypes = nodes.reduce((counts, node) => {
     counts[node.type] = (counts[node.type] || 0) + 1;
@@ -635,12 +912,19 @@ function snapshot() {
       maxEdgeLimit: Math.floor(NODE_COUNT * MAX_EDGE_RATIO),
       linkRadius: LINK_RADIUS,
       runningTasks,
+      activePackets: packetJourneys.filter((packet) => ['waiting', 'transmitting'].includes(packet.status)).length,
       completeTasks: tasks.filter((task) => task.status === 'complete').length,
       rejectedTasks: tasks.filter((task) => task.status === 'rejected').length
     },
     nodes,
     links,
-    tasks: tasks.slice(0, 18)
+    tasks: tasks.slice(0, 18).map((task) => ({
+      ...task,
+      packetJourneys: (task.packetIds || [])
+        .map((id) => packetJourneys.find((journey) => journey.id === id))
+        .filter(Boolean)
+    })),
+    packetJourneys: packetJourneys.slice(0, 32)
   };
 }
 
@@ -655,6 +939,7 @@ function step() {
   simulateLinks();
   simulateNodes();
   simulateTasks();
+  simulatePacketJourneys();
   const now = Date.now();
   if (now - lastAutoTaskAt > TASK_INTERVAL_MS) {
     lastAutoTaskAt = now;
@@ -766,6 +1051,7 @@ const server = http.createServer(async (req, res) => {
 
 createNodes();
 applyForceLayout();
+createStableTopology();
 createTask({ priority: '高' });
 setInterval(step, TICK_MS);
 server.listen(PORT, '0.0.0.0', () => {
