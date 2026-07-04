@@ -38,10 +38,12 @@ select {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 300px minmax(520px, 1fr) 340px;
+  grid-template-columns: minmax(272px, 296px) minmax(0, 1fr) minmax(300px, 336px);
   gap: 12px;
-  height: 100vh;
+  height: 100dvh;
+  min-height: 0;
   padding: 12px;
+  overflow: hidden;
 }
 
 .sidebar,
@@ -50,6 +52,9 @@ select {
   flex-direction: column;
   gap: 12px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .brand-block,
@@ -230,6 +235,8 @@ input:focus {
   grid-template-rows: 58px minmax(0, 1fr);
   gap: 12px;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .topbar {
@@ -273,6 +280,7 @@ input:focus {
 
 .view.active {
   display: block;
+  height: 100%;
 }
 
 #networkCanvas,
@@ -467,7 +475,7 @@ td {
   gap: 12px;
 }
 
-@media (max-width: 1180px) {
+@media (max-width: 1320px) {
   body {
     overflow: auto;
   }
@@ -477,12 +485,18 @@ td {
     grid-template-rows: auto 420px;
     height: auto;
     min-height: 100vh;
+    overflow: visible;
   }
 
   .inspector {
     grid-column: 1 / -1;
     display: grid;
     grid-template-columns: 1fr 1fr;
+    overflow: visible;
+  }
+
+  .sidebar {
+    overflow: visible;
   }
 }
 
