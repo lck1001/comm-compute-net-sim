@@ -16,3 +16,5 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+
+.codex_tmp_unzip_*/
