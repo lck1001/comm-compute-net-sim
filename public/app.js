@@ -3,6 +3,9 @@
   links: [],
   tasks: [],
   packetJourneys: [],
+  telemetryRecords: [],
+  relayLogs: [],
+  cloudInbox: [],
   summary: {},
   selectedTaskId: null,
   selectedNodeId: null,
@@ -36,6 +39,12 @@ const el = {
   splitStrategy: document.querySelector('#splitStrategy'),
   injectTask: document.querySelector('#injectTask'),
   injectStatus: document.querySelector('#injectStatus'),
+  previewPriority: document.querySelector('#previewPriority'),
+  previewCompute: document.querySelector('#previewCompute'),
+  previewStorage: document.querySelector('#previewStorage'),
+  previewData: document.querySelector('#previewData'),
+  previewLoad: document.querySelector('#previewLoad'),
+  previewLoadText: document.querySelector('#previewLoadText'),
   nodeCountInput: document.querySelector('#nodeCountInput'),
   edgeCountInput: document.querySelector('#edgeCountInput'),
   linkRadiusInput: document.querySelector('#linkRadiusInput'),
@@ -46,14 +55,19 @@ const el = {
   fragmentList: document.querySelector('#fragmentList'),
   traceTitle: document.querySelector('#traceTitle'),
   traceStatus: document.querySelector('#traceStatus'),
+  dataStats: document.querySelector('#dataStats'),
+  dataRows: document.querySelector('#dataRows'),
+  dataLog: document.querySelector('#dataLog'),
   hoverTip: document.querySelector('#hoverTip'),
   nodePopup: document.querySelector('#nodePopup'),
   networkCanvas: document.querySelector('#networkCanvas'),
-  traceCanvas: document.querySelector('#traceCanvas')
+  traceCanvas: document.querySelector('#traceCanvas'),
+  dataCanvas: document.querySelector('#dataCanvas')
 };
 
 const ctx = el.networkCanvas.getContext('2d');
 const traceCtx = el.traceCanvas.getContext('2d');
+const dataCtx = el.dataCanvas?.getContext('2d');
 
 function byId(id) {
   return document.getElementById(id);
@@ -66,6 +80,10 @@ function fmt(value, digits = 0) {
 
 function percent(value) {
   return `${Math.round((value || 0) * 100)}%`;
+}
+
+function timeLabel(ts) {
+  return ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) : '--';
 }
 
 function splitLabel(strategy) {
@@ -94,6 +112,21 @@ function taskPackets(task) {
   return state.packetJourneys.filter((packet) => ids.has(packet.id) || packet.taskId === task.id);
 }
 
+function hasTracePackets(task) {
+  return taskPackets(task).length > 0;
+}
+
+function latestTraceableTask() {
+  return state.tasks.find((task) => hasTracePackets(task)) || null;
+}
+
+function selectedTraceTask() {
+  const explicit = state.selectedTaskId
+    ? state.tasks.find((task) => task.id === state.selectedTaskId)
+    : null;
+  return explicit || latestTraceableTask() || state.tasks[0] || null;
+}
+
 function directionLabel(direction) {
   return direction === 'downlink' ? '下行控制' : '上行回传';
 }
@@ -111,8 +144,51 @@ function packetStatusLabel(status) {
   return labels[status] || status || '--';
 }
 
+function traceEmptyReason(task) {
+  if (!task) return '等待调度任务生成后，将显示单条数据包的逐跳路径。';
+  if (task.status === 'rejected') return task.message || '该任务未通过资源与链路约束校验，因此没有生成上/下行数据包。';
+  if (!task.accepted) return '该任务未被调度层接受，没有可追踪的数据包。';
+  if (task.packetIds?.length) return '该任务的数据包记录已被滚动缓存清理，请选择较新的运行任务。';
+  return '该任务尚未生成上行回传或下行控制数据包。';
+}
+
 function nodeById(id) {
   return state.nodes.find((node) => node.id === id);
+}
+
+function recentCloudInbox(nodeId, limit = 3) {
+  return state.cloudInbox
+    .filter((item) => item.cloudNodeId === nodeId)
+    .slice(0, limit);
+}
+
+function recentRelayLogs(nodeId, limit = 3) {
+  return state.relayLogs
+    .filter((item) => item.nodeId === nodeId)
+    .slice(0, limit);
+}
+
+function recentTelemetryFrom(nodeId, limit = 3) {
+  return state.telemetryRecords
+    .filter((item) => item.source === nodeId)
+    .slice(0, limit);
+}
+
+function taskUplinkPacket(task) {
+  return taskPackets(task).find((packet) => packet.direction === 'uplink') || null;
+}
+
+function telemetryForPacket(packet) {
+  if (!packet?.telemetryId) return null;
+  return state.telemetryRecords.find((record) => record.id === packet.telemetryId) || null;
+}
+
+function relayForTelemetry(telemetryId) {
+  return state.relayLogs.find((log) => log.telemetryId === telemetryId) || null;
+}
+
+function inboxForTelemetry(telemetryId) {
+  return state.cloudInbox.find((item) => item.telemetryId === telemetryId) || null;
 }
 
 function resizeCanvas(canvas, context) {
@@ -158,12 +234,26 @@ function renderOriginOptions() {
   if (interesting.some((node) => node.id === previous)) el.originSelect.value = previous;
 }
 
+function renderDemandPreview() {
+  if (!el.previewLoad) return;
+  const compute = Number(el.computeInput.value) || 0;
+  const storage = Number(el.storageInput.value) || 0;
+  const data = Number(el.dataInput.value) || 0;
+  const weightedLoad = Math.min(100, Math.round((compute / 3000) * 52 + (storage / 1800) * 22 + (data / 1800) * 26));
+  el.previewPriority.textContent = `${state.priority}优先级`;
+  el.previewCompute.textContent = fmt(compute);
+  el.previewStorage.textContent = fmt(storage);
+  el.previewData.textContent = fmt(data);
+  el.previewLoad.style.width = `${weightedLoad}%`;
+  el.previewLoadText.textContent = `${weightedLoad}%`;
+}
+
 function renderTaskList() {
   if (!state.tasks.length) {
     el.taskList.innerHTML = '<div class="empty-state">等待任务</div>';
     return;
   }
-  if (!state.selectedTaskId) state.selectedTaskId = state.tasks[0].id;
+  if (!state.selectedTaskId) state.selectedTaskId = latestTraceableTask()?.id || state.tasks[0].id;
   el.taskList.innerHTML = state.tasks
     .map((task) => {
       const statusClass = task.status === 'rejected' ? 'rejected' : task.status === 'complete' ? 'complete' : '';
@@ -202,8 +292,11 @@ function renderNodePopup(node, point, rect) {
   const active = state.links.filter((link) => link.active && (link.a === node.id || link.b === node.id));
   const totalLinkBandwidth = active.reduce((sum, link) => sum + link.bandwidth, 0);
   const avgCapacity = active.length ? active.reduce((sum, link) => sum + link.bandwidth * (1 - link.utilization), 0) / active.length : 0;
+  const cloudItems = node.type === 'Cloud' ? recentCloudInbox(node.id) : [];
+  const relayItems = node.type === 'Edge' ? recentRelayLogs(node.id) : [];
+  const telemetryItems = node.type === 'Terminal' ? recentTelemetryFrom(node.id) : [];
   // Position popup away from node to avoid blocking canvas mousemove
-  const popupW = 276, popupH = 244, gap = 18;
+  const popupW = 316, popupH = 372, gap = 18;
   const nodeRadius = node.type === 'Cloud' ? 10 : node.type === 'Edge' ? 8 : 6;
   const flipX = point.x > rect.width * 0.5;
   const flipY = point.y > rect.height * 0.55;
@@ -221,13 +314,43 @@ function renderNodePopup(node, point, rect) {
     node.computeFree,
     node.storageFree,
     Math.round(totalLinkBandwidth),
-    Math.round(avgCapacity)
+    Math.round(avgCapacity),
+    cloudItems.map((item) => `${item.telemetryId}:${item.receivedAt}`).join(','),
+    relayItems.map((item) => `${item.telemetryId}:${item.receivedAt}`).join(','),
+    telemetryItems.map((item) => `${item.id}:${item.status}`).join(',')
   ].join('|');
   if (state.popupRenderKey === renderKey) {
     el.nodePopup.classList.remove('hidden');
     return;
   }
   state.popupRenderKey = renderKey;
+  let telemetryPanel = '';
+  if (node.type === 'Cloud') {
+    telemetryPanel = `<section class="telemetry-panel">
+      <b>云端已接收数据</b>
+      ${cloudItems.length ? cloudItems.map((item) => `<div class="telemetry-item">
+        <span>${item.telemetryId} · ${item.source} 经 ${item.viaEdge || '--'}</span>
+        <em>${timeLabel(item.receivedAt)} · 信号 ${fmt(item.payload.signalStrength)} · ${fmt(item.payload.sampleSizeMb)} MB</em>
+      </div>`).join('') : '<div class="telemetry-empty">暂无终端回传数据</div>'}
+    </section>`;
+  } else if (node.type === 'Edge') {
+    telemetryPanel = `<section class="telemetry-panel">
+      <b>边缘中转记录</b>
+      ${relayItems.length ? relayItems.map((item) => `<div class="telemetry-item">
+        <span>${item.telemetryId} · 来自 ${item.source}</span>
+        <em>${timeLabel(item.receivedAt)} · 转发至云 · ${fmt(item.bottleneck)} Mbps</em>
+      </div>`).join('') : '<div class="telemetry-empty">暂无中转记录</div>'}
+    </section>`;
+  } else if (node.type === 'Terminal') {
+    telemetryPanel = `<section class="telemetry-panel">
+      <b>终端采集记录</b>
+      ${telemetryItems.length ? telemetryItems.map((item) => `<div class="telemetry-item">
+        <span>${item.id} · ${item.status}</span>
+        <em>${timeLabel(item.createdAt)} · 温度 ${fmt(item.payload.temperature, 1)} · 信号 ${fmt(item.payload.signalStrength)}</em>
+      </div>`).join('') : '<div class="telemetry-empty">暂无采集记录</div>'}
+    </section>`;
+  }
+
   el.nodePopup.innerHTML = `<header>
       <div><b>${node.id}</b><span>${node.label}</span></div>
       <button type="button" data-close-popup aria-label="close">×</button>
@@ -239,7 +362,8 @@ function renderNodePopup(node, point, rect) {
       <span><b>剩余存储</b><em>${fmt(node.storageFree)} / ${fmt(node.storageTotal)}</em></span>
       <span><b>通信容量</b><em>${fmt(avgCapacity)} Mbps</em></span>
       <span><b>所在链路容量</b><em>${fmt(totalLinkBandwidth)} Mbps</em></span>
-    </div>`;
+    </div>
+    ${telemetryPanel}`;
   el.nodePopup.classList.remove('hidden');
 }
 
@@ -263,38 +387,224 @@ function renderLinksTable() {
 
 function renderFragments(task) {
   if (!task) {
-    el.fragmentList.innerHTML = '';
+    el.fragmentList.innerHTML = '<div class="empty-state compact">暂无可追踪数据包</div>';
     return;
   }
   const packets = taskPackets(task);
+  if (!packets.length) {
+    el.fragmentList.innerHTML = `<div class="empty-state compact">
+      <b>${task.status === 'rejected' ? '任务已拒绝' : '暂无传输包'}</b>
+      <span>${traceEmptyReason(task)}</span>
+    </div>`;
+    return;
+  }
   const packetCards = packets
-    .map((packet) => `<article class="fragment-card packet-card ${packet.direction}">
+    .map((packet) => {
+      const path = packet.path || [];
+      const hopCount = Math.max(1, path.length - 1);
+      const hop = Math.min(hopCount - 1, Math.max(0, packet.currentHop || 0));
+      const nextHop = path[hop + 1] || path[path.length - 1] || '--';
+      return `<article class="fragment-card packet-card ${packet.direction}">
       <header>
         <span>${packet.id} · ${packet.label || directionLabel(packet.direction)}</span>
         <span>${packetStatusLabel(packet.status)} · ${Math.round((packet.progress || 0) * 100)}%</span>
       </header>
       <div class="progress packet-progress ${packet.direction}"><i style="width:${Math.round((packet.progress || 0) * 100)}%"></i></div>
-      <div class="meta-row">
-        <span>${directionLabel(packet.direction)}</span>
-        <span>${packet.path.join(' → ')}</span>
-        <span>${fmt(packet.data)} MB</span>
-        <span>${fmt(packet.latency)} ms / ${fmt(packet.bottleneck)} Mbps</span>
+      <div class="packet-kv">
+        <span><b>当前跳</b><em>${path[hop] || '--'} → ${nextHop}</em></span>
+        <span><b>完整路径</b><em>${path.join(' → ')}</em></span>
+        <span><b>数据编号</b><em>${packet.telemetryId || '--'}</em></span>
+        <span><b>数据量</b><em>${fmt(packet.data)} MB</em></span>
+        <span><b>时延</b><em>${fmt(packet.latency)} ms</em></span>
+        <span><b>瓶颈带宽</b><em>${fmt(packet.bottleneck)} Mbps</em></span>
+        <span><b>丢包率</b><em>${fmt(packet.loss, 2)}%</em></span>
       </div>
-    </article>`)
+    </article>`;
+    })
     .join('');
-  const fragmentCards = task.fragments
-    .map((fragment) => `<article class="fragment-card">
-      <header><span>${fragment.id} → ${fragment.nodeId}</span><span>${Math.round((fragment.progress || 0) * 100)}%</span></header>
-      <div class="progress"><i style="width:${Math.round((fragment.progress || 0) * 100)}%"></i></div>
-      <div class="meta-row">
-        <span>${fragment.stage}</span>
-        <span>${fragment.path.join(' → ')}</span>
-        <span>${fmt(fragment.compute)} 算力</span>
-        <span>${fmt(fragment.latency)} ms</span>
-      </div>
-    </article>`)
-    .join('');
-  el.fragmentList.innerHTML = `${packetCards}${fragmentCards}`;
+  el.fragmentList.innerHTML = packetCards;
+}
+
+function renderDataStats() {
+  if (!el.dataStats) return;
+  const transmitting = state.packetJourneys.filter((packet) => packet.direction === 'uplink' && ['waiting', 'transmitting'].includes(packet.status)).length;
+  const received = state.cloudInbox.length;
+  const relayed = state.relayLogs.length;
+  const latest = state.telemetryRecords[0];
+  el.dataStats.innerHTML = [
+    ['采集记录', fmt(state.telemetryRecords.length), '终端生成样本'],
+    ['已到云端', fmt(received), '完成入库数据'],
+    ['传输中', fmt(transmitting), '上行回传包'],
+    ['最新数据', latest ? timeLabel(latest.createdAt) : '--', latest ? latest.id : '等待采集']
+  ].map(([label, value, hint]) => `<article class="data-stat-card">
+      <b>${value}</b>
+      <span>${label}</span>
+      <em>${hint}</em>
+    </article>`).join('');
+}
+
+function drawDataCollection(time = 0) {
+  if (!el.dataCanvas || !dataCtx) return;
+  const rect = resizeCanvas(el.dataCanvas, dataCtx);
+  dataCtx.clearRect(0, 0, rect.width, rect.height);
+  dataCtx.fillStyle = '#071014';
+  dataCtx.fillRect(0, 0, rect.width, rect.height);
+
+  const records = state.telemetryRecords.slice(0, 14);
+  const rows = Math.max(8, records.length || 8);
+  const terminalX = 92;
+  const edgeX = rect.width * 0.48;
+  const cloudX = rect.width - 120;
+  const top = 46;
+  const bottom = rect.height - 36;
+  const rowGap = (bottom - top) / Math.max(1, rows - 1);
+  const edgeGroups = new Map();
+  records.forEach((record) => {
+    const key = record.viaEdge || 'N---';
+    if (!edgeGroups.has(key)) edgeGroups.set(key, []);
+    edgeGroups.get(key).push(record);
+  });
+  const edges = [...edgeGroups.keys()].slice(0, 6);
+  const edgePoints = edges.map((edgeId, index) => ({
+    id: edgeId,
+    x: edgeX,
+    y: top + (bottom - top) * (index + 0.5) / Math.max(1, edges.length)
+  }));
+
+  dataCtx.save();
+  dataCtx.strokeStyle = 'rgba(58, 75, 86, 0.16)';
+  dataCtx.lineWidth = 1;
+  for (let x = 36; x < rect.width; x += 56) {
+    dataCtx.beginPath();
+    dataCtx.moveTo(x, 18);
+    dataCtx.lineTo(x, rect.height - 18);
+    dataCtx.stroke();
+  }
+
+  const cloudGradient = dataCtx.createRadialGradient(cloudX, rect.height / 2, 8, cloudX, rect.height / 2, 64);
+  cloudGradient.addColorStop(0, 'rgba(246,196,83,0.55)');
+  cloudGradient.addColorStop(1, 'rgba(246,196,83,0.04)');
+  dataCtx.fillStyle = cloudGradient;
+  dataCtx.beginPath();
+  dataCtx.arc(cloudX, rect.height / 2, 66, 0, Math.PI * 2);
+  dataCtx.fill();
+
+  records.forEach((record, index) => {
+    const y = top + rowGap * index;
+    const edgePoint = edgePoints.find((point) => point.id === record.viaEdge) || { x: edgeX, y };
+    const inbox = inboxForTelemetry(record.id);
+    const relay = relayForTelemetry(record.id);
+    const packet = state.packetJourneys.find((item) => item.telemetryId === record.id);
+    const progress = packet?.progress || (inbox ? 1 : relay ? 0.58 : 0.16);
+
+    dataCtx.strokeStyle = inbox ? 'rgba(65,214,166,0.62)' : 'rgba(112,167,255,0.48)';
+    dataCtx.lineWidth = inbox ? 2.2 : 1.3;
+    dataCtx.beginPath();
+    dataCtx.moveTo(terminalX, y);
+    dataCtx.bezierCurveTo(rect.width * 0.26, y, rect.width * 0.34, edgePoint.y, edgePoint.x, edgePoint.y);
+    dataCtx.bezierCurveTo(rect.width * 0.62, edgePoint.y, rect.width * 0.72, rect.height / 2, cloudX, rect.height / 2);
+    dataCtx.stroke();
+
+    const particleT = (time / 1800 + index * 0.073) % 1;
+    const visibleT = Math.min(progress, particleT);
+    const px = visibleT < 0.5
+      ? terminalX + (edgePoint.x - terminalX) * (visibleT / 0.5)
+      : edgePoint.x + (cloudX - edgePoint.x) * ((visibleT - 0.5) / 0.5);
+    const py = visibleT < 0.5
+      ? y + (edgePoint.y - y) * (visibleT / 0.5)
+      : edgePoint.y + (rect.height / 2 - edgePoint.y) * ((visibleT - 0.5) / 0.5);
+    dataCtx.fillStyle = inbox ? '#41d6a6' : '#70a7ff';
+    dataCtx.shadowColor = dataCtx.fillStyle;
+    dataCtx.shadowBlur = 10;
+    dataCtx.beginPath();
+    dataCtx.arc(px, py, 3.2, 0, Math.PI * 2);
+    dataCtx.fill();
+    dataCtx.shadowBlur = 0;
+
+    dataCtx.fillStyle = '#70a7ff';
+    dataCtx.beginPath();
+    dataCtx.arc(terminalX, y, 6, 0, Math.PI * 2);
+    dataCtx.fill();
+    dataCtx.fillStyle = '#aebcbb';
+    dataCtx.font = '12px Segoe UI, sans-serif';
+    dataCtx.fillText(record.source, 18, y + 4);
+  });
+
+  edgePoints.forEach((point) => {
+    dataCtx.fillStyle = '#41d6a6';
+    dataCtx.beginPath();
+    dataCtx.arc(point.x, point.y, 9, 0, Math.PI * 2);
+    dataCtx.fill();
+    dataCtx.fillStyle = '#dce5e4';
+    dataCtx.font = '12px Segoe UI, sans-serif';
+    dataCtx.fillText(point.id, point.x - 24, point.y - 14);
+  });
+
+  dataCtx.fillStyle = '#f6c453';
+  dataCtx.shadowColor = '#f6c453';
+  dataCtx.shadowBlur = 18;
+  dataCtx.beginPath();
+  dataCtx.arc(cloudX, rect.height / 2, 18, 0, Math.PI * 2);
+  dataCtx.fill();
+  dataCtx.shadowBlur = 0;
+  dataCtx.fillStyle = '#dce5e4';
+  dataCtx.font = 'bold 14px Segoe UI, sans-serif';
+  dataCtx.fillText('N001 云端收件箱', cloudX - 54, rect.height / 2 + 42);
+  dataCtx.restore();
+}
+
+function drawTraceEmpty(rect, title, detail) {
+  const centerX = rect.width / 2;
+  const centerY = rect.height / 2;
+  traceCtx.save();
+  traceCtx.textAlign = 'center';
+  traceCtx.fillStyle = '#dce5e4';
+  traceCtx.font = '700 18px Segoe UI, sans-serif';
+  traceCtx.fillText(title, centerX, centerY - 12);
+  traceCtx.fillStyle = '#8fa19f';
+  traceCtx.font = '12px Segoe UI, sans-serif';
+  const text = detail.length > 52 ? `${detail.slice(0, 52)}...` : detail;
+  traceCtx.fillText(text, centerX, centerY + 14);
+  traceCtx.restore();
+}
+
+function renderDataCollection() {
+  renderDataStats();
+  if (el.dataRows) {
+    const rows = state.telemetryRecords.slice(0, 8);
+    el.dataRows.innerHTML = rows.length ? rows.map((record) => {
+      const inbox = inboxForTelemetry(record.id);
+      const relay = relayForTelemetry(record.id);
+      const status = inbox ? '已到云端' : relay ? '边缘中转' : '传输中';
+      return `<article class="data-record-row">
+        <b>${record.id}</b>
+        <span>${record.source} → ${record.viaEdge || '--'} → ${record.target}</span>
+        <span>${fmt(record.payload.temperature, 1)}°C / 信号 ${fmt(record.payload.signalStrength)}</span>
+        <span>${fmt(record.payload.computeFree)} 算力 / ${fmt(record.payload.storageFree)} 存储</span>
+        <em class="${inbox ? 'ok' : ''}">${status}</em>
+      </article>`;
+    }).join('') : '<div class="empty-state compact">等待终端采集数据</div>';
+  }
+  if (el.dataLog) {
+    const logs = [
+      ...state.cloudInbox.slice(0, 5).map((item) => ({ type: 'cloud', item, time: item.receivedAt })),
+      ...state.relayLogs.slice(0, 5).map((item) => ({ type: 'relay', item, time: item.receivedAt }))
+    ].sort((a, b) => b.time - a.time).slice(0, 8);
+    el.dataLog.innerHTML = logs.length ? logs.map(({ type, item }) => {
+      if (type === 'cloud') {
+        return `<article class="hop-log-item cloud">
+          <b>${item.telemetryId} 已到达云端</b>
+          <span>${item.source} 经 ${item.viaEdge || '--'} → ${item.cloudNodeId}</span>
+          <em>${timeLabel(item.receivedAt)} · ${fmt(item.latency)} ms · 丢包 ${fmt(item.loss, 2)}%</em>
+        </article>`;
+      }
+      return `<article class="hop-log-item relay">
+        <b>${item.telemetryId} 边缘中转</b>
+        <span>${item.source} → ${item.nodeId} → N001</span>
+        <em>${timeLabel(item.receivedAt)} · 瓶颈 ${fmt(item.bottleneck)} Mbps</em>
+      </article>`;
+    }).join('') : '<div class="empty-state compact">暂无逐跳日志</div>';
+  }
 }
 
 function nodeHitRadius(node) {
@@ -559,23 +869,28 @@ function drawTopology(time = 0) {
 }
 
 function renderTrace() {
-  const task = selectedTask();
+  const task = selectedTraceTask();
   const rect = resizeCanvas(el.traceCanvas, traceCtx);
   drawBackground(traceCtx, rect);
   if (!task) {
-    el.traceTitle.textContent = '暂无任务';
+    el.traceTitle.textContent = '暂无数据包';
     el.traceStatus.textContent = '等待调度';
     renderFragments(null);
+    drawTraceEmpty(rect, '暂无可追踪数据包', traceEmptyReason(null));
     return;
   }
-  el.traceTitle.textContent = `${task.id} · ${task.origin} 发起`;
+  const packets = taskPackets(task);
+  const firstPacket = packets[0];
+  el.traceTitle.textContent = firstPacket ? `${firstPacket.id} · ${directionLabel(firstPacket.direction)} · ${task.origin}` : `${task.id} · 单包追踪`;
   el.traceStatus.textContent = task.status;
   renderFragments(task);
+  if (!packets.length) {
+    drawTraceEmpty(rect, task.status === 'rejected' ? '任务已拒绝' : '暂无传输包', traceEmptyReason(task));
+    return;
+  }
 
-  const packets = taskPackets(task);
   const streams = [
-    ...packets.map((packet) => ({ type: 'packet', item: packet })),
-    ...(task.fragments || []).map((fragment) => ({ type: 'fragment', item: fragment }))
+    ...packets.map((packet) => ({ type: 'packet', item: packet }))
   ].slice(0, 8);
   const lanes = Math.max(1, streams.length);
   const top = 48;
@@ -626,9 +941,11 @@ function renderTrace() {
 function renderAll() {
   updateSummary();
   renderOriginOptions();
+  renderDemandPreview();
   renderTaskList();
   renderLinksTable();
   renderTrace();
+  renderDataCollection();
 }
 
 function applyState(payload) {
@@ -660,6 +977,9 @@ function applyState(payload) {
   state.links = payload.links || [];
   state.tasks = payload.tasks || [];
   state.packetJourneys = payload.packetJourneys || [];
+  state.telemetryRecords = payload.telemetryRecords || [];
+  state.relayLogs = payload.relayLogs || [];
+  state.cloudInbox = payload.cloudInbox || [];
   state.summary = payload.summary || {};
   state.tick = payload.tick || 0;
   state.paused = payload.paused || false;
@@ -674,8 +994,10 @@ function applyState(payload) {
       state.linkRadius = payload.summary.linkRadius;
     }
   }
-  if (!state.selectedTaskId && state.tasks.length) state.selectedTaskId = state.tasks[0].id;
-  if (state.selectedTaskId && !state.tasks.some((task) => task.id === state.selectedTaskId)) state.selectedTaskId = state.tasks[0]?.id || null;
+  if (!state.selectedTaskId && state.tasks.length) state.selectedTaskId = latestTraceableTask()?.id || state.tasks[0].id;
+  if (state.selectedTaskId && !state.tasks.some((task) => task.id === state.selectedTaskId)) {
+    state.selectedTaskId = latestTraceableTask()?.id || state.tasks[0]?.id || null;
+  }
   if (state.popupNodeId && !state.nodes.some((node) => node.id === state.popupNodeId)) state.popupNodeId = null;
   renderAll();
 }
@@ -743,6 +1065,7 @@ function bindEvents() {
       document.querySelectorAll('.segmented button').forEach((btn) => btn.classList.remove('active'));
       button.classList.add('active');
       state.priority = button.dataset.priority;
+      renderDemandPreview();
     });
   });
 
@@ -816,6 +1139,9 @@ function bindEvents() {
     const maxEdge = Math.floor(nodeCount / 3);
     el.edgeCountInput.max = maxEdge;
     if (Number(el.edgeCountInput.value) > maxEdge) el.edgeCountInput.value = maxEdge;
+  });
+  [el.computeInput, el.storageInput, el.dataInput].forEach((input) => {
+    input.addEventListener('input', renderDemandPreview);
   });
   el.injectTask.addEventListener('click', injectTask);
   el.resetSim.addEventListener('click', resetSimulation);
@@ -892,6 +1218,11 @@ function animate(time) {
     drawTopology(renderTime);
     const traceView = byId('traceView');
     if (traceView.classList.contains('active')) renderTrace();
+    const dataView = byId('dataView');
+    if (dataView?.classList.contains('active')) {
+      drawDataCollection(renderTime);
+      renderDataCollection();
+    }
     state.lastFrame = time;
   }
   requestAnimationFrame(animate);

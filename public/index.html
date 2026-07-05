@@ -63,6 +63,24 @@
               <button data-priority="紧急">紧急</button>
             </div>
           </div>
+          <div class="demand-preview" aria-label="任务需求概览">
+            <div class="demand-preview-head">
+              <span>需求概览</span>
+              <b id="previewPriority">中优先级</b>
+            </div>
+            <div class="demand-preview-grid">
+              <span><b id="previewCompute">960</b><em>算力</em></span>
+              <span><b id="previewStorage">420</b><em>存储</em></span>
+              <span><b id="previewData">520</b><em>数据</em></span>
+            </div>
+            <div class="demand-load">
+              <i id="previewLoad"></i>
+            </div>
+            <div class="demand-preview-foot">
+              <span>综合负载</span>
+              <b id="previewLoadText">--</b>
+            </div>
+          </div>
           <div class="task-spacer"></div>
           <button id="injectTask" class="primary-button">注入任务</button>
           <div id="injectStatus" class="inject-status hidden"></div>
@@ -74,7 +92,8 @@
           <div class="tabs" role="tablist">
             <button class="active" data-view="topology">动态拓扑</button>
             <button data-view="links">链路详情</button>
-            <button data-view="trace">回传追踪</button>
+            <button data-view="trace">单包追踪</button>
+            <button data-view="data">数据采集</button>
           </div>
           <div class="topbar-legend">
             <span class="legend-dot" style="background:#f6c453"></span>云
@@ -125,6 +144,32 @@
             </div>
             <canvas id="traceCanvas" aria-label="packet trace"></canvas>
             <div id="fragmentList" class="fragment-list"></div>
+          </div>
+        </section>
+
+        <section id="dataView" class="view data-view">
+          <div class="data-board">
+            <div id="dataStats" class="data-stats"></div>
+            <section class="collector-map">
+              <div class="collector-title">
+                <div>
+                  <span class="eyebrow">端-边-云数据汇聚</span>
+                  <h2>终端采集数据上行回传态势</h2>
+                </div>
+                <span class="collector-badge">实时采集</span>
+              </div>
+              <canvas id="dataCanvas" aria-label="data collection flow"></canvas>
+            </section>
+            <section class="data-bottom">
+              <article class="data-table-panel">
+                <header><b>采集数据记录</b><span>按最新采样排序</span></header>
+                <div id="dataRows" class="data-records"></div>
+              </article>
+              <article class="data-log-panel">
+                <header><b>逐跳回传日志</b><span>边缘中转与云端入库</span></header>
+                <div id="dataLog" class="hop-log"></div>
+              </article>
+            </section>
           </div>
         </section>
       </section>

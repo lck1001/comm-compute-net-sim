@@ -12,6 +12,9 @@ const TICK_MS = 900;
 const TASK_INTERVAL_MS = 6800;
 const MAX_TASKS = 36;
 const MAX_PACKET_JOURNEYS = 96;
+const MAX_TELEMETRY_RECORDS = 120;
+const MAX_RELAY_LOGS = 160;
+const MAX_CLOUD_INBOX = 120;
 
 function defaultEdgeCount(total) {
   return Math.min(total - 1, Math.max(10, Math.ceil(total / 3)));
@@ -44,9 +47,13 @@ const nodes = [];
 const links = [];
 const tasks = [];
 const packetJourneys = [];
+const telemetryRecords = [];
+const relayLogs = [];
+const cloudInbox = [];
 let nextTaskId = 1;
 let nextLinkId = 1;
 let nextPacketId = 1;
+let nextTelemetryId = 1;
 let lastAutoTaskAt = 0;
 let tickCount = 0;
 let paused = false;
@@ -490,6 +497,42 @@ function buildDownlinkRoute(targetId) {
   return uplink ? [...uplink].reverse() : null;
 }
 
+function createTelemetryRecord(sourceId, task, path) {
+  const source = getNode(sourceId);
+  if (!source) return null;
+  const viaEdge = path?.find((nodeId) => getNode(nodeId)?.type === 'Edge') || null;
+  const record = {
+    id: `D${String(nextTelemetryId++).padStart(4, '0')}`,
+    taskId: task.id,
+    source: source.id,
+    sourceName: source.name,
+    sourceZone: source.zone,
+    viaEdge,
+    target: path?.[path.length - 1] || 'N001',
+    path: path || [],
+    payload: {
+      temperature: Number(between(31.5, 39.2).toFixed(1)),
+      signalStrength: Math.round(between(58, 96)),
+      terminalLoad: Number(source.load.toFixed(2)),
+      computeFree: Math.round(source.computeFree),
+      storageFree: Math.round(source.storageFree),
+      sampleSizeMb: Math.max(8, Math.round(task.demand.data * between(0.18, 0.42)))
+    },
+    status: 'generated',
+    createdAt: Date.now(),
+    relayedAt: null,
+    receivedAt: null,
+    packetId: null
+  };
+  telemetryRecords.unshift(record);
+  while (telemetryRecords.length > MAX_TELEMETRY_RECORDS) telemetryRecords.pop();
+  return record;
+}
+
+function telemetryById(id) {
+  return telemetryRecords.find((record) => record.id === id);
+}
+
 function createPacketJourney(options) {
   const path = options.path?.filter(Boolean);
   if (!path?.length) return null;
@@ -499,6 +542,7 @@ function createPacketJourney(options) {
     id: `P${String(nextPacketId++).padStart(4, '0')}`,
     taskId: options.taskId,
     kind: options.kind,
+    telemetryId: options.telemetryId || null,
     label: options.label,
     direction: options.direction,
     origin: path[0],
@@ -526,15 +570,22 @@ function attachPacketJourneys(task) {
   const downlink = buildDownlinkRoute(task.origin);
   const journeys = [];
   if (uplink) {
-    journeys.push(createPacketJourney({
+    const telemetry = createTelemetryRecord(task.origin, task, uplink);
+    const journey = createPacketJourney({
       taskId: task.id,
       kind: 'situation',
+      telemetryId: telemetry?.id,
       label: '上行态势回传',
       direction: 'uplink',
       path: uplink,
       data: task.demand.data,
       priority: task.priority
-    }));
+    });
+    if (telemetry && journey) {
+      telemetry.packetId = journey.id;
+      telemetry.status = 'transmitting';
+    }
+    journeys.push(journey);
   }
   if (downlink) {
     journeys.push(createPacketJourney({
@@ -694,9 +745,13 @@ function resetSimulation(opts = {}) {
   links.length = 0;
   tasks.length = 0;
   packetJourneys.length = 0;
+  telemetryRecords.length = 0;
+  relayLogs.length = 0;
+  cloudInbox.length = 0;
   nextTaskId = 1;
   nextLinkId = 1;
   nextPacketId = 1;
+  nextTelemetryId = 1;
   lastAutoTaskAt = 0;
   tickCount = 0;
   paused = false;
@@ -849,6 +904,73 @@ function simulateTasks() {
   }
 }
 
+function recordRelayArrival(journey, nodeId, now) {
+  if (journey.direction !== 'uplink' || !journey.telemetryId) return;
+  const node = getNode(nodeId);
+  const record = telemetryById(journey.telemetryId);
+  if (!node || !record || node.type !== 'Edge') return;
+  const duplicate = relayLogs.some((log) => log.telemetryId === record.id && log.nodeId === node.id);
+  if (duplicate) return;
+  const log = {
+    id: `R${String(relayLogs.length + 1).padStart(4, '0')}`,
+    telemetryId: record.id,
+    packetId: journey.id,
+    taskId: journey.taskId,
+    nodeId: node.id,
+    nodeName: node.name,
+    source: record.source,
+    action: 'relay',
+    receivedAt: now,
+    forwardedAt: now + Math.round(between(80, 320)),
+    latency: journey.latency,
+    bottleneck: journey.bottleneck
+  };
+  relayLogs.unshift(log);
+  while (relayLogs.length > MAX_RELAY_LOGS) relayLogs.pop();
+  record.status = 'relayed';
+  record.viaEdge = node.id;
+  record.relayedAt = now;
+}
+
+function recordCloudArrival(journey, now) {
+  if (journey.direction !== 'uplink' || !journey.telemetryId) return;
+  const record = telemetryById(journey.telemetryId);
+  if (!record || cloudInbox.some((item) => item.telemetryId === record.id)) return;
+  const cloudNode = getNode(journey.target);
+  const item = {
+    id: `C${String(cloudInbox.length + 1).padStart(4, '0')}`,
+    telemetryId: record.id,
+    packetId: journey.id,
+    taskId: journey.taskId,
+    cloudNodeId: cloudNode?.id || journey.target,
+    source: record.source,
+    sourceName: record.sourceName,
+    sourceZone: record.sourceZone,
+    viaEdge: record.viaEdge || journey.path.find((nodeId) => getNode(nodeId)?.type === 'Edge') || null,
+    receivedAt: now,
+    path: journey.path,
+    payload: record.payload,
+    latency: journey.latency,
+    bottleneck: journey.bottleneck,
+    loss: journey.loss
+  };
+  cloudInbox.unshift(item);
+  while (cloudInbox.length > MAX_CLOUD_INBOX) cloudInbox.pop();
+  record.status = 'cloud_received';
+  record.receivedAt = now;
+}
+
+function processJourneyArrivals(journey, reachedIndex, now) {
+  if (!Number.isFinite(journey.lastReachedIndex)) journey.lastReachedIndex = 0;
+  if (reachedIndex <= journey.lastReachedIndex) return;
+  for (let index = journey.lastReachedIndex + 1; index <= reachedIndex; index += 1) {
+    const nodeId = journey.path[index];
+    recordRelayArrival(journey, nodeId, now);
+    if (index === journey.path.length - 1) recordCloudArrival(journey, now);
+  }
+  journey.lastReachedIndex = reachedIndex;
+}
+
 function simulatePacketJourneys() {
   const now = Date.now();
   for (const journey of packetJourneys) {
@@ -866,6 +988,8 @@ function simulatePacketJourneys() {
     journey.latency = Math.round(metrics.latency || journey.latency || 0);
     journey.bottleneck = Math.round(metrics.bottleneck || journey.bottleneck || 0);
     journey.loss = Number((metrics.loss || journey.loss || 0).toFixed(2));
+    const reachedIndex = Math.min(journey.path.length - 1, Math.floor(journey.progress * hopCount));
+    processJourneyArrivals(journey, reachedIndex, now);
 
     if (journey.path.length > 1 && journey.status !== 'complete') {
       const aId = journey.path[journey.currentHop];
@@ -883,6 +1007,7 @@ function simulatePacketJourneys() {
       }
     } else if (journey.status === 'complete' && !journey.completedAt) {
       journey.completedAt = now;
+      processJourneyArrivals(journey, journey.path.length - 1, now);
     }
   }
 }
@@ -913,6 +1038,9 @@ function snapshot() {
       linkRadius: LINK_RADIUS,
       runningTasks,
       activePackets: packetJourneys.filter((packet) => ['waiting', 'transmitting'].includes(packet.status)).length,
+      telemetryRecords: telemetryRecords.length,
+      relayLogs: relayLogs.length,
+      cloudInbox: cloudInbox.length,
       completeTasks: tasks.filter((task) => task.status === 'complete').length,
       rejectedTasks: tasks.filter((task) => task.status === 'rejected').length
     },
@@ -924,7 +1052,10 @@ function snapshot() {
         .map((id) => packetJourneys.find((journey) => journey.id === id))
         .filter(Boolean)
     })),
-    packetJourneys: packetJourneys.slice(0, 32)
+    packetJourneys: packetJourneys.slice(0, 32),
+    telemetryRecords: telemetryRecords.slice(0, 48),
+    relayLogs: relayLogs.slice(0, 64),
+    cloudInbox: cloudInbox.slice(0, 48)
   };
 }
 
