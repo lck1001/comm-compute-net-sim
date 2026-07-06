@@ -13,6 +13,7 @@
   popupNodeId: null,
   popupRenderKey: null,
   originOptionsKey: null,
+  situationSourceOptionsKey: null,
   priority: '中',
   paused: false,
   linkRadius: 0.55,
@@ -64,6 +65,9 @@ const el = {
   dataRows: document.querySelector('#dataRows'),
   dataLog: document.querySelector('#dataLog'),
   remoteImageInput: document.querySelector('#remoteImageInput'),
+  situationSourceSelect: document.querySelector('#situationSourceSelect'),
+  situationDescriptionInput: document.querySelector('#situationDescriptionInput'),
+  situationStatus: document.querySelector('#situationStatus'),
   triggerTsScan: document.querySelector('#triggerTsScan'),
   tsStats: document.querySelector('#tsStats'),
   tsDetectionList: document.querySelector('#tsDetectionList'),
@@ -204,6 +208,35 @@ function inboxForTelemetry(telemetryId) {
   return state.cloudInbox.find((item) => item.telemetryId === telemetryId) || null;
 }
 
+function isSituationRecord(record) {
+  return record?.payload?.kind === 'image_situation_description';
+}
+
+function latestSituationRecord() {
+  return state.telemetryRecords.find(isSituationRecord) || null;
+}
+
+function situationDescriptionText(record) {
+  return record?.payload?.description || '暂无态势描述';
+}
+
+function shortText(text, length = 72) {
+  const value = String(text || '').trim();
+  return value.length > length ? `${value.slice(0, length)}...` : value || '--';
+}
+
+function defaultSituationDescription(source) {
+  const id = source?.id || '终端节点';
+  return `${id} 拍摄到遥感画面：图中可见海域背景、多条态势航迹线和若干目标标注，疑似存在海面/空中平台协同行动；请经边缘节点回传至云端进行态势融合展示。`;
+}
+
+function fillDefaultSituationDescription(force = false) {
+  if (!el.situationDescriptionInput) return;
+  if (!force && el.situationDescriptionInput.value.trim()) return;
+  const source = nodeById(el.situationSourceSelect?.value) || state.nodes.find((node) => node.type === 'Terminal');
+  el.situationDescriptionInput.value = defaultSituationDescription(source);
+}
+
 function resizeCanvas(canvas, context) {
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -253,6 +286,27 @@ function renderOriginOptions() {
       || interesting[0];
     if (preferred) el.originSelect.value = preferred.id;
   }
+}
+
+function renderSituationSourceOptions() {
+  if (!el.situationSourceSelect) return;
+  const previous = el.situationSourceSelect.value;
+  const terminals = state.nodes
+    .filter((node) => node.type === 'Terminal' && node.status === 'online')
+    .sort((left, right) => (right.computeFree + right.storageFree) - (left.computeFree + left.storageFree));
+  const candidates = terminals.length ? terminals : state.nodes.filter((node) => node.type !== 'Cloud');
+  const signature = candidates.map((node) => `${node.id}:${node.gatewayEdgeId || ''}:${node.status}`).join('|');
+  if (signature === state.situationSourceOptionsKey) {
+    if (candidates.some((node) => node.id === previous)) el.situationSourceSelect.value = previous;
+    return;
+  }
+  state.situationSourceOptionsKey = signature;
+  el.situationSourceSelect.innerHTML = candidates
+    .map((node) => `<option value="${node.id}">${node.id} · ${node.label}${node.gatewayEdgeId ? ` → ${node.gatewayEdgeId}` : ''}</option>`)
+    .join('');
+  if (candidates.some((node) => node.id === previous)) el.situationSourceSelect.value = previous;
+  else if (candidates[0]) el.situationSourceSelect.value = candidates[0].id;
+  fillDefaultSituationDescription();
 }
 
 function renderDemandPreview() {
@@ -356,7 +410,7 @@ function renderNodePopup(node, point, rect) {
       <b>云端已接收数据</b>
       ${cloudItems.length ? cloudItems.map((item) => `<div class="telemetry-item">
         <span>${item.telemetryId} · ${item.source} 经 ${item.viaEdge || '--'}</span>
-        <em>${timeLabel(item.receivedAt)} · 信号 ${fmt(item.payload.signalStrength)} · ${fmt(item.payload.sampleSizeMb)} MB</em>
+        <em>${isSituationRecord(item) ? `${item.payload.imageName || '遥感图'} · ${shortText(item.payload.description, 36)}` : `信号 ${fmt(item.payload.signalStrength)} · ${fmt(item.payload.sampleSizeMb)} MB`}</em>
       </div>`).join('') : '<div class="telemetry-empty">暂无终端回传数据</div>'}
     </section>`;
   } else if (node.type === 'Edge') {
@@ -372,7 +426,7 @@ function renderNodePopup(node, point, rect) {
       <b>终端采集记录</b>
       ${telemetryItems.length ? telemetryItems.map((item) => `<div class="telemetry-item">
         <span>${item.id} · ${item.status}</span>
-        <em>${timeLabel(item.createdAt)} · 温度 ${fmt(item.payload.temperature, 1)} · 信号 ${fmt(item.payload.signalStrength)}</em>
+        <em>${isSituationRecord(item) ? `${item.payload.imageName || '遥感图'} · ${shortText(item.payload.description, 36)}` : `温度 ${fmt(item.payload.temperature, 1)} · 信号 ${fmt(item.payload.signalStrength)}`}</em>
       </div>`).join('') : '<div class="telemetry-empty">暂无采集记录</div>'}
     </section>`;
   }
@@ -615,11 +669,12 @@ function renderDataCollection() {
       const inbox = inboxForTelemetry(record.id);
       const relay = relayForTelemetry(record.id);
       const status = inbox ? '已到云端' : relay ? '边缘中转' : '传输中';
+      const situation = isSituationRecord(record);
       return `<article class="data-record-row">
         <b>${record.id}</b>
         <span>${record.source} → ${record.viaEdge || '--'} → ${record.target}</span>
-        <span>${fmt(record.payload.temperature, 1)}°C / 信号 ${fmt(record.payload.signalStrength)}</span>
-        <span>${fmt(record.payload.computeFree)} 算力 / ${fmt(record.payload.storageFree)} 存储</span>
+        <span>${situation ? `图像态势 · ${shortText(record.payload.imageName, 16)}` : `${fmt(record.payload.temperature, 1)}°C / 信号 ${fmt(record.payload.signalStrength)}`}</span>
+        <span>${situation ? shortText(record.payload.description, 30) : `${fmt(record.payload.computeFree)} 算力 / ${fmt(record.payload.storageFree)} 存储`}</span>
         <em class="${inbox ? 'ok' : ''}">${status}</em>
       </article>`;
     }).join('') : '<div class="empty-state compact">等待终端采集数据</div>';
@@ -631,10 +686,11 @@ function renderDataCollection() {
     ].sort((a, b) => b.time - a.time).slice(0, 8);
     el.dataLog.innerHTML = logs.length ? logs.map(({ type, item }) => {
       if (type === 'cloud') {
+        const situation = item.payload?.kind === 'image_situation_description';
         return `<article class="hop-log-item cloud">
           <b>${item.telemetryId} 已到达云端</b>
           <span>${item.source} 经 ${item.viaEdge || '--'} → ${item.cloudNodeId}</span>
-          <em>${timeLabel(item.receivedAt)} · ${fmt(item.latency)} ms · 丢包 ${fmt(item.loss, 2)}%</em>
+          <em>${timeLabel(item.receivedAt)} · ${situation ? shortText(item.payload.description, 42) : `${fmt(item.latency)} ms · 丢包 ${fmt(item.loss, 2)}%`}</em>
         </article>`;
       }
       return `<article class="hop-log-item relay">
@@ -668,6 +724,85 @@ function renderTSSensing(time = 0) {
     sensingCtx.font = '13px Segoe UI, sans-serif';
     sensingCtx.fillText('可在左侧上传遥感图作为感知底图', 24, rect.height - 24);
     sensingCtx.restore();
+  }
+  const situation = latestSituationRecord();
+  if (situation) {
+    const inbox = inboxForTelemetry(situation.id);
+    const relay = relayForTelemetry(situation.id);
+    const packet = state.packetJourneys.find((item) => item.telemetryId === situation.id);
+    const path = situation.path || packet?.path || [];
+    const nodeMap = new Map(state.nodes.map((node) => [node.id, node]));
+    const points = path.map((nodeId) => {
+      const node = nodeMap.get(nodeId);
+      return node ? { node, point: tsPoint(node, rect) } : null;
+    }).filter(Boolean);
+
+    sensingCtx.save();
+    if (points.length > 1) {
+      sensingCtx.strokeStyle = inbox ? 'rgba(65,214,166,0.78)' : 'rgba(112,167,255,0.7)';
+      sensingCtx.lineWidth = inbox ? 3 : 2;
+      sensingCtx.shadowColor = inbox ? '#41d6a6' : '#70a7ff';
+      sensingCtx.shadowBlur = 12;
+      sensingCtx.beginPath();
+      points.forEach(({ point }, index) => {
+        if (index === 0) sensingCtx.moveTo(point.x, point.y);
+        else sensingCtx.lineTo(point.x, point.y);
+      });
+      sensingCtx.stroke();
+      sensingCtx.shadowBlur = 0;
+
+      const progress = packet?.progress ?? (inbox ? 1 : relay ? 0.58 : 0.18);
+      const segment = Math.max(0, Math.min(points.length - 2, Math.floor(progress * (points.length - 1))));
+      const local = Math.min(1, Math.max(0, progress * (points.length - 1) - segment));
+      const a = points[segment]?.point || points[0].point;
+      const b = points[segment + 1]?.point || points.at(-1).point;
+      const px = a.x + (b.x - a.x) * local;
+      const py = a.y + (b.y - a.y) * local;
+      sensingCtx.fillStyle = inbox ? '#41d6a6' : '#f6c453';
+      sensingCtx.shadowColor = sensingCtx.fillStyle;
+      sensingCtx.shadowBlur = 14;
+      sensingCtx.beginPath();
+      sensingCtx.arc(px, py, 6, 0, Math.PI * 2);
+      sensingCtx.fill();
+      sensingCtx.shadowBlur = 0;
+    }
+
+    points.forEach(({ node, point }) => {
+      sensingCtx.fillStyle = node.color || '#dce5e4';
+      sensingCtx.beginPath();
+      sensingCtx.arc(point.x, point.y, node.type === 'Cloud' ? 13 : node.type === 'Edge' ? 10 : 8, 0, Math.PI * 2);
+      sensingCtx.fill();
+      sensingCtx.fillStyle = '#eef7f6';
+      sensingCtx.font = '700 12px Segoe UI, sans-serif';
+      sensingCtx.fillText(node.id, point.x + 12, point.y - 10);
+    });
+    sensingCtx.restore();
+
+    if (el.sensingTitle) el.sensingTitle.textContent = `${situation.id} · ${situation.payload.imageName || state.remoteImageName || '遥感图'}`;
+    if (el.sensingBadge) el.sensingBadge.textContent = inbox ? '云端已接收' : relay ? '边缘中转中' : '上行回传中';
+    if (el.tsStats) {
+      el.tsStats.innerHTML = [
+        ['图源', situation.payload.imageName || state.remoteImageName || '--', '终端拍摄'],
+        ['来源', situation.source, situation.sourceName || '终端节点'],
+        ['路径', path.join(' → ') || '--', '端-边-云'],
+        ['状态', inbox ? '已入云' : relay ? '边缘中转' : '传输中', inbox ? timeLabel(inbox.receivedAt) : '等待云端接收']
+      ].map(([label, value, hint]) => `<article class="data-stat-card">
+        <b>${value}</b><span>${label}</span><em>${hint}</em>
+      </article>`).join('');
+    }
+    if (el.tsDetectionList) {
+      el.tsDetectionList.innerHTML = `<article class="ts-detection-card fused situation-card">
+        <header><b>云端态势描述</b><span>${inbox ? '已接收' : '回传中'}</span></header>
+        <p>${situationDescriptionText(situation)}</p>
+        <div class="packet-kv">
+          <span><b>坐标</b><em>${fmt(situation.payload.latitude, 4)}, ${fmt(situation.payload.longitude, 4)}</em></span>
+          <span><b>图片</b><em>${situation.payload.imageName || '--'}</em></span>
+          <span><b>数据量</b><em>${fmt(situation.payload.sampleSizeMb)} MB</em></span>
+          <span><b>云端</b><em>${inbox?.cloudNodeId || situation.target || '--'}</em></span>
+        </div>
+      </article>`;
+    }
+    return;
   }
   if (!frame) {
     if (el.sensingTitle) el.sensingTitle.textContent = '等待协同态势感知帧';
@@ -1114,6 +1249,7 @@ function renderTrace() {
 function renderAll() {
   updateSummary();
   renderOriginOptions();
+  renderSituationSourceOptions();
   renderDemandPreview();
   renderTaskList();
   renderLinksTable();
@@ -1264,6 +1400,7 @@ function bindEvents() {
       state._remoteImageUrl = url;
       state.remoteImage = image;
       state.remoteImageName = file.name;
+      fillDefaultSituationDescription();
       renderTSSensing();
     };
     image.src = url;
@@ -1272,16 +1409,37 @@ function bindEvents() {
   async function triggerTSSensing() {
     if (!el.triggerTsScan) return;
     el.triggerTsScan.disabled = true;
+    if (el.situationStatus) {
+      el.situationStatus.className = 'inject-status hidden';
+      el.situationStatus.textContent = '';
+    }
     try {
-      const res = await fetch('/api/ts-sensing/scan', {
+      const description = el.situationDescriptionInput?.value?.trim() || '';
+      const sourceId = el.situationSourceSelect?.value || '';
+      const res = await fetch('/api/situation-descriptions', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ imageName: state.remoteImageName || '遥感图' })
+        body: JSON.stringify({
+          sourceId,
+          imageName: state.remoteImageName || '遥感图',
+          description
+        })
       });
       if (res.ok) {
-        const frame = await res.json();
-        state.tsSensingFrames = [frame, ...state.tsSensingFrames].slice(0, 12);
-        renderTSSensing();
+        const result = await res.json();
+        const stateRes = await fetch('/api/state');
+        if (stateRes.ok) applyState(await stateRes.json());
+        document.querySelectorAll('.tabs button').forEach((btn) => btn.classList.toggle('active', btn.dataset.view === 'sensing'));
+        document.querySelectorAll('.view').forEach((view) => view.classList.remove('active'));
+        byId('sensingView')?.classList.add('active');
+        if (el.situationStatus) {
+          el.situationStatus.className = 'inject-status accepted';
+          el.situationStatus.textContent = `已生成 ${result.record.id}，路径 ${result.route.join(' → ')}`;
+        }
+      } else if (el.situationStatus) {
+        const err = await res.json().catch(() => ({}));
+        el.situationStatus.className = 'inject-status rejected';
+        el.situationStatus.textContent = err.message || '态势描述上传失败';
       }
     } finally {
       el.triggerTsScan.disabled = false;
@@ -1387,6 +1545,28 @@ function bindEvents() {
         message: task.message || ''
       }));
     }
+    if (kind === 'telemetry') {
+      return state.telemetryRecords.map((record) => ({
+        record_id: record.id,
+        task_id: record.taskId,
+        packet_id: record.packetId,
+        payload_kind: record.payload?.kind || 'sensor_sample',
+        source_node_id: record.source,
+        source_name: record.sourceName,
+        via_edge_id: record.viaEdge,
+        target_node_id: record.target,
+        path: record.path,
+        image_name: record.payload?.imageName || '',
+        situation_description: record.payload?.description || '',
+        latitude: record.payload?.latitude || '',
+        longitude: record.payload?.longitude || '',
+        signal_strength: record.payload?.signalStrength || '',
+        sample_size_mb: record.payload?.sampleSizeMb || '',
+        status: record.status,
+        created_at: record.createdAt ? new Date(record.createdAt).toISOString() : '',
+        received_at: record.receivedAt ? new Date(record.receivedAt).toISOString() : ''
+      }));
+    }
     return [];
   }
 
@@ -1477,6 +1657,7 @@ function bindEvents() {
   el.resetSim.addEventListener('click', resetSimulation);
   el.togglePause.addEventListener('click', togglePause);
   el.remoteImageInput?.addEventListener('change', (event) => loadRemoteImage(event.target.files?.[0]));
+  el.situationSourceSelect?.addEventListener('change', () => fillDefaultSituationDescription(true));
   el.triggerTsScan?.addEventListener('click', triggerTSSensing);
   document.querySelectorAll('[data-export]').forEach((button) => {
     button.addEventListener('click', () => exportDataset(button.dataset.export));

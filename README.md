@@ -158,11 +158,30 @@ GET /api/export/ts-sensing?format=csv&limit=1000
 - `tx_mbps`、`rx_mbps`、`load`、`status`
 - `gateway_edge_id`、`backup_edge_id`
 
-### 遥感图协同态势感知
+### 遥感图态势描述回传
 
-浏览器端可在“数据接入”面板上传遥感图，图像只作为当前浏览器展示底图，不上传服务器。点击“协同态势感知”后，后端基于当前仿真节点、载体轨迹和链路状态生成一帧态势感知结果：
+浏览器端可在“数据接入”面板上传遥感图，图像作为当前浏览器展示底图；用户在“态势描述”中填写人工或大模型生成的图像描述。点击“上传态势描述”后，系统会假设所选终端节点拍摄到该图像，并把描述作为上行数据包经“终端 → 边缘 → 云端”路径回传。云节点收到后会在“态势感知”和“数据采集”视图展示该描述、坐标、路径和接收状态。
 
-接口路径保留 `ts-sensing`，其中 `TS` 为“态势”的业务缩写；界面面向演示统一显示“态势感知”。
+新业务接口：
+
+```http
+POST /api/situation-descriptions
+Content-Type: application/json
+
+{
+  "sourceId": "N068",
+  "imageName": "remote-sensing.jpg",
+  "description": "终端拍摄到海域态势图，包含多条航迹线、目标标注和疑似协同活动，需要回传云端展示。"
+}
+```
+
+返回内容包含：
+
+- `record`：图像态势描述数据记录，`payload.kind = image_situation_description`。
+- `journey`：该描述的上行数据包，含数据包编号、进度、时延、瓶颈带宽和路径。
+- `route`：端边云回传路径，例如 `N068 → N035 → N001`。
+
+兼容接口仍保留 `ts-sensing`，其中 `TS` 为“态势”的业务缩写；界面面向演示统一显示“态势感知”。它可用于旧的仿真态势帧生成：
 
 ```http
 POST /api/ts-sensing/scan

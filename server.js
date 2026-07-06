@@ -548,6 +548,85 @@ function createTelemetryRecord(sourceId, task, path) {
   return record;
 }
 
+function defaultSituationDescription(source, imageName) {
+  const geo = nodeGeo(source);
+  const lat = geo.latitude.toFixed(4);
+  const lng = geo.longitude.toFixed(4);
+  return `${source.id} 终端在 ${lat}, ${lng} 采集到 ${imageName || '遥感图'}：图中可见海域背景、多条态势航迹线及若干目标标注，疑似存在海面/空中平台协同活动，建议上传云端进行态势融合展示。`;
+}
+
+function createSituationDescriptionRecord(options = {}) {
+  const source = getNode(options.sourceId)
+    || nodes.find((node) => node.type === 'Terminal' && node.status === 'online' && node.gatewayEdgeId)
+    || nodes.find((node) => node.type === 'Terminal')
+    || nodes.find((node) => node.type === 'Edge')
+    || nodes[0];
+  if (!source) return { error: 'no_source_node', message: '当前没有可用节点' };
+  const path = buildUplinkRoute(source.id);
+  if (!path?.length || path.length < 2) {
+    return { error: 'no_uplink_route', message: `${source.id} 暂无可用上行链路` };
+  }
+  const imageName = String(options.imageName || '遥感图').slice(0, 120);
+  const description = String(options.description || '').trim().slice(0, 1200) || defaultSituationDescription(source, imageName);
+  const geo = nodeGeo(source);
+  const tags = Array.isArray(options.tags)
+    ? options.tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 8)
+    : ['图像描述', '态势回传', '云端融合'];
+  const viaEdge = path.find((nodeId) => getNode(nodeId)?.type === 'Edge') || null;
+  const taskId = `IMG${String(nextTelemetryId).padStart(4, '0')}`;
+  const sampleSizeMb = Math.max(6, Math.round(description.length / 16 + between(6, 18)));
+  const record = {
+    id: `D${String(nextTelemetryId++).padStart(4, '0')}`,
+    taskId,
+    source: source.id,
+    sourceName: source.name,
+    sourceZone: source.zone,
+    viaEdge,
+    target: path[path.length - 1],
+    path,
+    payload: {
+      kind: 'image_situation_description',
+      imageName,
+      description,
+      tags,
+      latitude: Number(geo.latitude.toFixed(5)),
+      longitude: Number(geo.longitude.toFixed(5)),
+      locationText: options.locationText || `${geo.latitude.toFixed(4)}, ${geo.longitude.toFixed(4)}`,
+      capturedBy: source.id,
+      capturedAt: Date.now(),
+      signalStrength: Math.round(between(66, 98)),
+      terminalLoad: Number(source.load.toFixed(2)),
+      computeFree: Math.round(source.computeFree),
+      storageFree: Math.round(source.storageFree),
+      sampleSizeMb
+    },
+    status: 'generated',
+    createdAt: Date.now(),
+    relayedAt: null,
+    receivedAt: null,
+    packetId: null
+  };
+  telemetryRecords.unshift(record);
+  while (telemetryRecords.length > MAX_TELEMETRY_RECORDS) telemetryRecords.pop();
+
+  const journey = createPacketJourney({
+    taskId,
+    kind: 'image_situation',
+    telemetryId: record.id,
+    label: '图像态势描述回传',
+    direction: 'uplink',
+    path,
+    data: sampleSizeMb,
+    priority: options.priority || '高',
+    speedMultiplier: 24
+  });
+  if (journey) {
+    record.packetId = journey.id;
+    record.status = 'transmitting';
+  }
+  return { record, journey, route: path };
+}
+
 function telemetryById(id) {
   return telemetryRecords.find((record) => record.id === id);
 }
@@ -576,7 +655,8 @@ function createPacketJourney(options) {
     status: Number(options.delayMs || 0) > 0 ? 'waiting' : 'transmitting',
     latency: Math.round(metrics.latency || 0),
     bottleneck: Math.round(metrics.bottleneck || 0),
-    loss: Number((metrics.loss || 0).toFixed(2))
+    loss: Number((metrics.loss || 0).toFixed(2)),
+    speedMultiplier: Math.max(1, Number(options.speedMultiplier || 1))
   };
   packetJourneys.unshift(journey);
   while (packetJourneys.length > MAX_PACKET_JOURNEYS) packetJourneys.pop();
@@ -1111,7 +1191,8 @@ function simulatePacketJourneys() {
     const metrics = pathMetrics(journey.path) || { bottleneck: journey.bottleneck || 120, latency: journey.latency || 20 };
     const hopCount = Math.max(1, journey.path.length - 1);
     const speed = clamp((metrics.bottleneck || 120) / Math.max(180, journey.data * 3.2), 0.025, 0.18);
-    journey.progress = clamp(journey.progress + speed * between(0.05, 0.11), 0, 1);
+    const multiplier = Math.max(1, Number(journey.speedMultiplier || 1));
+    journey.progress = clamp(journey.progress + speed * between(0.05, 0.11) * multiplier, 0, 1);
     journey.currentHop = Math.min(hopCount - 1, Math.floor(journey.progress * hopCount));
     journey.status = journey.progress >= 0.995 ? 'complete' : 'transmitting';
     journey.latency = Math.round(metrics.latency || journey.latency || 0);
@@ -1490,12 +1571,19 @@ function databaseATelemetryRecords(limit = 120) {
     record_id: record.id,
     task_id: record.taskId,
     packet_id: record.packetId,
+    payload_kind: record.payload.kind || 'sensor_sample',
     source_node_id: record.source,
     source_name: record.sourceName,
     source_zone: record.sourceZone,
     via_edge_id: record.viaEdge,
     target_node_id: record.target,
     path: record.path,
+    image_name: record.payload.imageName || null,
+    situation_description: record.payload.description || null,
+    latitude: record.payload.latitude || null,
+    longitude: record.payload.longitude || null,
+    location_text: record.payload.locationText || null,
+    tags: record.payload.tags || null,
     temperature: record.payload.temperature,
     signal_strength: record.payload.signalStrength,
     terminal_load: record.payload.terminalLoad,
@@ -1594,7 +1682,8 @@ function databaseAInterfaces() {
       { method: 'GET', path: '/api/database-a/telemetry-records', description: '终端上行态势采样数据' },
       { method: 'GET', path: '/api/database-a/relay-arrival-logs', description: '边缘中转记录与云端入库记录合并表' },
       { method: 'GET', path: '/api/database-a/ts-sensing', description: '遥感图协同态势感知：目标、传感节点、融合节点、置信度' },
-      { method: 'POST', path: '/api/ts-sensing/scan', description: '基于当前遥感图名称触发一次协同态势感知帧生成' },
+      { method: 'POST', path: '/api/situation-descriptions', description: '终端图像态势描述上行回传，经边缘节点转发至云端收件箱' },
+      { method: 'POST', path: '/api/ts-sensing/scan', description: '兼容接口：基于当前遥感图名称触发一次协同态势感知帧生成' },
       { method: 'GET', path: '/api/export/nodes?format=csv', description: '导出节点快照，format 支持 json/csv' },
       { method: 'GET', path: '/api/export/links?format=csv', description: '导出链路状态，format 支持 json/csv' },
       { method: 'GET', path: '/api/export/tasks?format=csv', description: '导出任务和分片状态，format 支持 json/csv' }
@@ -1791,6 +1880,13 @@ const server = http.createServer(async (req, res) => {
       const frame = createTSSensingFrame(body);
       broadcast('state', snapshot());
       return json(res, 201, frame);
+    }
+    if (url.pathname === '/api/situation-descriptions' && req.method === 'POST') {
+      const body = await readBody(req);
+      const result = createSituationDescriptionRecord(body);
+      if (result.error) return json(res, 400, result);
+      broadcast('state', snapshot());
+      return json(res, 201, result);
     }
     if (url.pathname === '/api/tasks' && req.method === 'GET') return json(res, 200, tasks.slice(0, 30));
     if (url.pathname === '/api/tasks' && req.method === 'POST') {

@@ -36,11 +36,21 @@
             <label for="remoteImageInput">遥感图</label>
             <input id="remoteImageInput" type="file" accept="image/*" />
           </div>
-          <button id="triggerTsScan" class="primary-button ts-button">协同态势感知</button>
+          <div class="situation-source-row">
+            <label for="situationSourceSelect">拍摄终端</label>
+            <select id="situationSourceSelect"></select>
+          </div>
+          <div class="situation-description-row">
+            <label for="situationDescriptionInput">态势描述</label>
+            <textarea id="situationDescriptionInput" rows="3" placeholder="描述图上可见目标、位置、航迹或异常态势"></textarea>
+          </div>
+          <button id="triggerTsScan" class="primary-button ts-button">上传态势描述</button>
+          <div id="situationStatus" class="inject-status hidden"></div>
           <div class="export-grid">
             <button type="button" data-export="nodes">导出节点</button>
             <button type="button" data-export="links">导出链路</button>
             <button type="button" data-export="tasks">导出任务</button>
+            <button type="button" data-export="telemetry">导出采集</button>
           </div>
         </section>
 
