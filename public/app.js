@@ -6,6 +6,7 @@
   telemetryRecords: [],
   relayLogs: [],
   cloudInbox: [],
+  tsSensingFrames: [],
   summary: {},
   selectedTaskId: null,
   selectedNodeId: null,
@@ -16,10 +17,14 @@
   paused: false,
   linkRadius: 0.55,
   popupHovered: false,
+  editingEdgeCount: false,
+  edgeCountTouched: false,
   mouse: { x: 0, y: 0, inside: false },
   nodeScreen: new Map(),
   tick: 0,
-  lastFrame: 0
+  lastFrame: 0,
+  remoteImage: null,
+  remoteImageName: ''
 };
 
 const el = {
@@ -58,16 +63,24 @@ const el = {
   dataStats: document.querySelector('#dataStats'),
   dataRows: document.querySelector('#dataRows'),
   dataLog: document.querySelector('#dataLog'),
+  remoteImageInput: document.querySelector('#remoteImageInput'),
+  triggerTsScan: document.querySelector('#triggerTsScan'),
+  tsStats: document.querySelector('#tsStats'),
+  tsDetectionList: document.querySelector('#tsDetectionList'),
+  sensingTitle: document.querySelector('#sensingTitle'),
+  sensingBadge: document.querySelector('#sensingBadge'),
   hoverTip: document.querySelector('#hoverTip'),
   nodePopup: document.querySelector('#nodePopup'),
   networkCanvas: document.querySelector('#networkCanvas'),
   traceCanvas: document.querySelector('#traceCanvas'),
-  dataCanvas: document.querySelector('#dataCanvas')
+  dataCanvas: document.querySelector('#dataCanvas'),
+  sensingCanvas: document.querySelector('#sensingCanvas')
 };
 
 const ctx = el.networkCanvas.getContext('2d');
 const traceCtx = el.traceCanvas.getContext('2d');
 const dataCtx = el.dataCanvas?.getContext('2d');
+const sensingCtx = el.sensingCanvas?.getContext('2d');
 
 function byId(id) {
   return document.getElementById(id);
@@ -232,6 +245,14 @@ function renderOriginOptions() {
     .map((node) => `<option value="${node.id}">${node.id} · ${node.label}</option>`)
     .join('');
   if (interesting.some((node) => node.id === previous)) el.originSelect.value = previous;
+  else {
+    const preferred = [...state.nodes]
+      .filter((node) => node.type === 'Terminal' && node.status === 'online' && node.gatewayEdgeId)
+      .sort((left, right) => (right.computeFree + right.storageFree) - (left.computeFree + left.storageFree))[0]
+      || state.nodes.find((node) => node.type === 'Edge' && node.status === 'online')
+      || interesting[0];
+    if (preferred) el.originSelect.value = preferred.id;
+  }
 }
 
 function renderDemandPreview() {
@@ -246,6 +267,11 @@ function renderDemandPreview() {
   el.previewData.textContent = fmt(data);
   el.previewLoad.style.width = `${weightedLoad}%`;
   el.previewLoadText.textContent = `${weightedLoad}%`;
+}
+
+function recommendedEdgeCount(nodeCount) {
+  if (!Number.isFinite(nodeCount)) return 10;
+  return Math.min(Math.floor(nodeCount / 3), Math.max(10, Math.floor(nodeCount / 3)));
 }
 
 function renderTaskList() {
@@ -422,7 +448,20 @@ function renderFragments(task) {
     </article>`;
     })
     .join('');
-  el.fragmentList.innerHTML = packetCards;
+  const graph = task.taskGraph;
+  const graphCard = graph?.edges?.length ? `<article class="fragment-card task-graph-card">
+      <header>
+        <span>首尾相接有向图</span>
+        <span>${graph.nodes.length} 点 / ${graph.edges.length} 边</span>
+      </header>
+      <div class="graph-flow">
+        ${graph.edges.slice(0, 14).map((edge) => `<span class="${edge.role}">
+          <b>${edge.from} → ${edge.to}</b>
+          <em>${edge.role === 'dispatch' ? '下发' : edge.role === 'gather' ? '汇聚' : '接力'} · ${Math.round((edge.ratio || 0) * 100)}%</em>
+        </span>`).join('')}
+      </div>
+    </article>` : '';
+  el.fragmentList.innerHTML = packetCards + graphCard;
 }
 
 function renderDataStats() {
@@ -607,6 +646,118 @@ function renderDataCollection() {
   }
 }
 
+function tsPoint(item, rect) {
+  const pad = 28;
+  return {
+    x: pad + (item.x || 0.5) * (rect.width - pad * 2),
+    y: pad + (item.y || 0.5) * (rect.height - pad * 2)
+  };
+}
+
+function renderTSSensing(time = 0) {
+  if (!el.sensingCanvas || !sensingCtx) return;
+  const frame = latestTsFrame();
+  const rect = resizeCanvas(el.sensingCanvas, sensingCtx);
+  drawBackground(sensingCtx, rect);
+  const hasImage = drawRemoteImageBackground(sensingCtx, rect, 0.86);
+  if (!hasImage) {
+    sensingCtx.save();
+    sensingCtx.fillStyle = 'rgba(65, 214, 166, 0.05)';
+    sensingCtx.fillRect(0, 0, rect.width, rect.height);
+    sensingCtx.fillStyle = '#91a4a4';
+    sensingCtx.font = '13px Segoe UI, sans-serif';
+    sensingCtx.fillText('可在左侧上传遥感图作为感知底图', 24, rect.height - 24);
+    sensingCtx.restore();
+  }
+  if (!frame) {
+    if (el.sensingTitle) el.sensingTitle.textContent = '等待协同态势感知帧';
+    if (el.sensingBadge) el.sensingBadge.textContent = '未感知';
+    if (el.tsStats) el.tsStats.innerHTML = '<div class="empty-state compact">暂无态势感知结果</div>';
+    if (el.tsDetectionList) el.tsDetectionList.innerHTML = '';
+    return;
+  }
+
+  if (el.sensingTitle) el.sensingTitle.textContent = `${frame.id} · ${frame.sourceImageName || state.remoteImageName || '遥感图'}`;
+  if (el.sensingBadge) el.sensingBadge.textContent = `${fmt(frame.fusedCount)} 融合 / ${fmt(frame.detections.length)} 目标`;
+
+  const detections = frame.detections || [];
+  const nodeMap = new Map(state.nodes.map((node) => [node.id, node]));
+  sensingCtx.save();
+  for (const detection of detections) {
+    const target = tsPoint(detection.target, rect);
+    for (const sensorRef of detection.sensor_nodes || []) {
+      const sensor = nodeMap.get(sensorRef.node_id);
+      if (!sensor) continue;
+      const sensorPoint = tsPoint(sensor, rect);
+      sensingCtx.globalAlpha = 0.18 + sensorRef.confidence * 0.48;
+      sensingCtx.strokeStyle = detection.status === 'fused' ? '#41d6a6' : '#f6c453';
+      sensingCtx.lineWidth = 1 + sensorRef.confidence * 1.8;
+      sensingCtx.setLineDash([8, 7]);
+      sensingCtx.beginPath();
+      sensingCtx.moveTo(sensorPoint.x, sensorPoint.y);
+      sensingCtx.lineTo(target.x, target.y);
+      sensingCtx.stroke();
+    }
+  }
+  sensingCtx.setLineDash([]);
+
+  for (const node of state.nodes.filter((item) => item.type !== 'Cloud').slice(0, 120)) {
+    const point = tsPoint(node, rect);
+    sensingCtx.globalAlpha = node.type === 'Edge' ? 0.82 : 0.42;
+    sensingCtx.fillStyle = node.color;
+    sensingCtx.beginPath();
+    sensingCtx.arc(point.x, point.y, node.type === 'Edge' ? 4.6 : 2.6, 0, Math.PI * 2);
+    sensingCtx.fill();
+  }
+
+  detections.forEach((detection, index) => {
+    const point = tsPoint(detection.target, rect);
+    const color = detection.status === 'fused' ? '#41d6a6' : detection.status === 'tracking' ? '#70a7ff' : '#f6c453';
+    const pulse = 8 + Math.sin(time / 260 + index) * 2.5;
+    sensingCtx.globalAlpha = 0.18;
+    sensingCtx.fillStyle = color;
+    sensingCtx.beginPath();
+    sensingCtx.arc(point.x, point.y, 18 + pulse, 0, Math.PI * 2);
+    sensingCtx.fill();
+    sensingCtx.globalAlpha = 0.95;
+    sensingCtx.strokeStyle = color;
+    sensingCtx.lineWidth = 2;
+    sensingCtx.beginPath();
+    sensingCtx.arc(point.x, point.y, 9, 0, Math.PI * 2);
+    sensingCtx.stroke();
+    sensingCtx.fillStyle = color;
+    sensingCtx.beginPath();
+    sensingCtx.arc(point.x, point.y, 3.4, 0, Math.PI * 2);
+    sensingCtx.fill();
+    sensingCtx.fillStyle = '#eef7f6';
+    sensingCtx.font = '700 11px Segoe UI, sans-serif';
+    sensingCtx.fillText(`${detection.target.id} ${Math.round(detection.confidence * 100)}%`, point.x + 12, point.y - 10);
+  });
+  sensingCtx.restore();
+
+  if (el.tsStats) {
+    el.tsStats.innerHTML = [
+      ['目标', fmt(detections.length), '态势目标'],
+      ['融合', fmt(frame.fusedCount), '高置信'],
+      ['弱感知', fmt(frame.weakCount), '需补采'],
+      ['图源', state.remoteImageName || frame.sourceImageName || '--', '当前底图']
+    ].map(([label, value, hint]) => `<article class="data-stat-card">
+      <b>${value}</b><span>${label}</span><em>${hint}</em>
+    </article>`).join('');
+  }
+  if (el.tsDetectionList) {
+    el.tsDetectionList.innerHTML = detections.map((detection) => `<article class="ts-detection-card ${detection.status}">
+      <header><b>${detection.target.id} · ${detection.target.class}</b><span>${Math.round(detection.confidence * 100)}%</span></header>
+      <div class="packet-kv">
+        <span><b>融合节点</b><em>${detection.fusion_node_id}</em></span>
+        <span><b>感知节点</b><em>${detection.sensor_nodes.map((sensor) => sensor.node_id).join(' / ') || '--'}</em></span>
+        <span><b>坐标</b><em>${fmt(detection.target.latitude, 4)}, ${fmt(detection.target.longitude, 4)}</em></span>
+        <span><b>时延</b><em>${fmt(detection.latency_ms)} ms</em></span>
+      </div>
+    </article>`).join('');
+  }
+}
+
 function nodeHitRadius(node) {
   return node.type === 'Cloud' ? 22 : node.type === 'Edge' ? 18 : 15;
 }
@@ -675,6 +826,27 @@ function drawBackground(context, rect) {
   }
 }
 
+function latestTsFrame() {
+  return state.tsSensingFrames?.[0] || null;
+}
+
+function drawRemoteImageBackground(context, rect, alpha = 0.78) {
+  if (!state.remoteImage) return false;
+  const image = state.remoteImage;
+  const scale = Math.max(rect.width / image.width, rect.height / image.height);
+  const width = image.width * scale;
+  const height = image.height * scale;
+  const x = (rect.width - width) / 2;
+  const y = (rect.height - height) / 2;
+  context.save();
+  context.globalAlpha = alpha;
+  context.drawImage(image, x, y, width, height);
+  context.fillStyle = 'rgba(4, 13, 22, 0.38)';
+  context.fillRect(0, 0, rect.width, rect.height);
+  context.restore();
+  return true;
+}
+
 function toScreen(node, rect) {
   const pad = 28;
   // Interpolate between previous and current position for smooth motion
@@ -691,6 +863,7 @@ function toScreen(node, rect) {
 function drawTopology(time = 0) {
   const rect = resizeCanvas(el.networkCanvas, ctx);
   drawBackground(ctx, rect);
+  drawRemoteImageBackground(ctx, rect, 0.62);
   state.nodeScreen.clear();
   for (const node of state.nodes) state.nodeScreen.set(node.id, toScreen(node, rect));
 
@@ -946,6 +1119,7 @@ function renderAll() {
   renderLinksTable();
   renderTrace();
   renderDataCollection();
+  renderTSSensing();
 }
 
 function applyState(payload) {
@@ -980,6 +1154,7 @@ function applyState(payload) {
   state.telemetryRecords = payload.telemetryRecords || [];
   state.relayLogs = payload.relayLogs || [];
   state.cloudInbox = payload.cloudInbox || [];
+  state.tsSensingFrames = payload.tsSensingFrames || [];
   state.summary = payload.summary || {};
   state.tick = payload.tick || 0;
   state.paused = payload.paused || false;
@@ -987,8 +1162,8 @@ function applyState(payload) {
   el.togglePause.style.background = state.paused ? '#41d6a6' : '#f6c453';
   if (payload.summary) {
     el.edgeCountInput.max = payload.summary.maxEdgeLimit || Math.floor((payload.summary.nodeCount || 200) / 3);
-    if (!el.edgeCountInput.value || Number(el.edgeCountInput.value) > Number(el.edgeCountInput.max)) {
-      el.edgeCountInput.value = payload.summary.edgeLimit || Math.min(66, el.edgeCountInput.max);
+    if (!state.editingEdgeCount && !state.edgeCountTouched) {
+      el.edgeCountInput.value = payload.summary.edgeLimit || recommendedEdgeCount(payload.summary.nodeCount || 200);
     }
     if (payload.summary.linkRadius !== undefined) {
       state.linkRadius = payload.summary.linkRadius;
@@ -1076,8 +1251,144 @@ function bindEvents() {
       button.classList.add('active');
       byId(`${button.dataset.view}View`).classList.add('active');
       renderTrace();
+      renderTSSensing();
     });
   });
+
+  function loadRemoteImage(file) {
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      if (state._remoteImageUrl) URL.revokeObjectURL(state._remoteImageUrl);
+      state._remoteImageUrl = url;
+      state.remoteImage = image;
+      state.remoteImageName = file.name;
+      renderTSSensing();
+    };
+    image.src = url;
+  }
+
+  async function triggerTSSensing() {
+    if (!el.triggerTsScan) return;
+    el.triggerTsScan.disabled = true;
+    try {
+      const res = await fetch('/api/ts-sensing/scan', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ imageName: state.remoteImageName || '遥感图' })
+      });
+      if (res.ok) {
+        const frame = await res.json();
+        state.tsSensingFrames = [frame, ...state.tsSensingFrames].slice(0, 12);
+        renderTSSensing();
+      }
+    } finally {
+      el.triggerTsScan.disabled = false;
+    }
+  }
+
+  function exportDataset(kind) {
+    const endpoint = `/api/export/${kind}?format=csv&limit=1000`;
+    fetch(endpoint)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.text();
+      })
+      .then((csv) => downloadText(`${kind}.csv`, csv))
+      .catch(() => {
+        const rows = localExportRows(kind);
+        if (!rows.length) {
+          alert('当前页面暂无可导出的数据，请刷新或等待仿真状态加载完成。');
+          return;
+        }
+        downloadText(`${kind}.csv`, rowsToCsv(rows));
+      });
+  }
+
+  function csvValue(value) {
+    if (Array.isArray(value) || (value && typeof value === 'object')) value = JSON.stringify(value);
+    const text = value === undefined || value === null ? '' : String(value);
+    return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  }
+
+  function rowsToCsv(rows) {
+    if (!rows.length) return '';
+    const headers = Object.keys(rows[0]);
+    return [
+      headers.join(','),
+      ...rows.map((row) => headers.map((header) => csvValue(row[header])).join(','))
+    ].join('\n');
+  }
+
+  function downloadText(filename, text) {
+    const blob = new Blob([`\ufeff${text}`], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function localExportRows(kind) {
+    if (kind === 'nodes') {
+      return state.nodes.map((node) => ({
+        node_id: node.id,
+        name: node.name,
+        type: node.type,
+        zone: node.zone,
+        x: Number(node.x?.toFixed?.(4) ?? node.x),
+        y: Number(node.y?.toFixed?.(4) ?? node.y),
+        compute_total: Math.round(node.computeTotal || 0),
+        compute_free: Math.round(node.computeFree || 0),
+        storage_total: Math.round(node.storageTotal || 0),
+        storage_free: Math.round(node.storageFree || 0),
+        tx_mbps: Number((node.txMbps || 0).toFixed(2)),
+        rx_mbps: Number((node.rxMbps || 0).toFixed(2)),
+        load: Number((node.load || 0).toFixed(3)),
+        status: node.status,
+        gateway_edge_id: node.gatewayEdgeId || '',
+        backup_edge_id: node.backupEdgeId || ''
+      }));
+    }
+    if (kind === 'links') {
+      return state.links.map((link) => ({
+        link_id: link.id,
+        node_a: link.a,
+        node_b: link.b,
+        role: link.role,
+        bandwidth_mbps: Math.round(link.bandwidth || 0),
+        latency_ms: Math.round(link.latency || 0),
+        loss_rate: Number((link.loss || 0).toFixed(2)),
+        utilization: Number((link.utilization || 0).toFixed(3)),
+        distance_m: Number((link.distance || 0).toFixed(1)),
+        active: Boolean(link.active),
+        persistent: Boolean(link.persistent)
+      }));
+    }
+    if (kind === 'tasks') {
+      return state.tasks.map((task) => ({
+        task_id: task.id,
+        origin_node_id: task.origin,
+        demand_compute: Math.round(task.demand?.compute || 0),
+        demand_storage: Math.round(task.demand?.storage || 0),
+        demand_data: Math.round(task.demand?.data || 0),
+        priority: task.priority,
+        split_strategy: task.splitStrategy,
+        status: task.status,
+        accepted: Boolean(task.accepted),
+        progress: Number((task.progress || 0).toFixed(3)),
+        fragment_count: task.fragments?.length || 0,
+        graph_node_count: task.taskGraph?.nodes?.length || 0,
+        graph_edge_count: task.taskGraph?.edges?.length || 0,
+        message: task.message || ''
+      }));
+    }
+    return [];
+  }
 
   async function resetSimulation() {
     const nodeCount = Number(el.nodeCountInput.value);
@@ -1105,6 +1416,8 @@ function bindEvents() {
       });
       if (res.ok) {
         const payload = await res.json();
+        state.edgeCountTouched = false;
+        state.editingEdgeCount = false;
         applyState(payload);
       } else {
         const err = await res.json();
@@ -1138,7 +1451,24 @@ function bindEvents() {
     const nodeCount = Number(el.nodeCountInput.value) || 200;
     const maxEdge = Math.floor(nodeCount / 3);
     el.edgeCountInput.max = maxEdge;
-    if (Number(el.edgeCountInput.value) > maxEdge) el.edgeCountInput.value = maxEdge;
+    state.edgeCountTouched = false;
+    el.edgeCountInput.value = recommendedEdgeCount(nodeCount);
+  });
+  el.edgeCountInput.addEventListener('focus', () => {
+    state.editingEdgeCount = true;
+  });
+  el.edgeCountInput.addEventListener('input', () => {
+    state.editingEdgeCount = true;
+    state.edgeCountTouched = true;
+  });
+  el.edgeCountInput.addEventListener('blur', () => {
+    state.editingEdgeCount = false;
+    const nodeCount = Number(el.nodeCountInput.value) || state.summary.nodeCount || 200;
+    const maxEdge = Math.floor(nodeCount / 3);
+    const value = Number(el.edgeCountInput.value);
+    if (Number.isFinite(value)) {
+      el.edgeCountInput.value = Math.min(maxEdge, Math.max(3, Math.round(value)));
+    }
   });
   [el.computeInput, el.storageInput, el.dataInput].forEach((input) => {
     input.addEventListener('input', renderDemandPreview);
@@ -1146,6 +1476,11 @@ function bindEvents() {
   el.injectTask.addEventListener('click', injectTask);
   el.resetSim.addEventListener('click', resetSimulation);
   el.togglePause.addEventListener('click', togglePause);
+  el.remoteImageInput?.addEventListener('change', (event) => loadRemoteImage(event.target.files?.[0]));
+  el.triggerTsScan?.addEventListener('click', triggerTSSensing);
+  document.querySelectorAll('[data-export]').forEach((button) => {
+    button.addEventListener('click', () => exportDataset(button.dataset.export));
+  });
   el.networkCanvas.addEventListener('mousemove', (event) => {
     const rect = el.networkCanvas.getBoundingClientRect();
     state.mouse = { x: event.clientX - rect.left, y: event.clientY - rect.top, inside: true };
@@ -1223,6 +1558,8 @@ function animate(time) {
       drawDataCollection(renderTime);
       renderDataCollection();
     }
+    const sensingView = byId('sensingView');
+    if (sensingView?.classList.contains('active')) renderTSSensing(renderTime);
     state.lastFrame = time;
   }
   requestAnimationFrame(animate);

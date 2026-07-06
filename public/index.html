@@ -14,7 +14,7 @@
           <p id="clock">等待数据</p>
         </section>
 
-        <section class="panel controls-panel">
+        <section class="panel controls-panel sim-config-panel">
           <div class="panel-title">仿真设置</div>
           <div class="form-row inline-fields">
             <span class="compact"><label for="nodeCountInput">节点</label><input id="nodeCountInput" type="number" min="3" max="2000" step="10" value="200"></span>
@@ -30,7 +30,21 @@
           </div>
         </section>
 
-        <section class="panel controls-panel task-panel-fill">
+        <section class="panel controls-panel data-ingest-panel">
+          <div class="panel-title">数据接入</div>
+          <div class="import-row">
+            <label for="remoteImageInput">遥感图</label>
+            <input id="remoteImageInput" type="file" accept="image/*" />
+          </div>
+          <button id="triggerTsScan" class="primary-button ts-button">协同态势感知</button>
+          <div class="export-grid">
+            <button type="button" data-export="nodes">导出节点</button>
+            <button type="button" data-export="links">导出链路</button>
+            <button type="button" data-export="tasks">导出任务</button>
+          </div>
+        </section>
+
+        <section class="panel controls-panel task-panel-fill task-inject-panel">
           <div class="panel-title">任务注入</div>
           <div class="form-row">
             <label class="sr-only" for="originSelect">发起节点</label>
@@ -73,9 +87,7 @@
               <span><b id="previewStorage">420</b><em>存储</em></span>
               <span><b id="previewData">520</b><em>数据</em></span>
             </div>
-            <div class="demand-load">
-              <i id="previewLoad"></i>
-            </div>
+            <div class="demand-load"><i id="previewLoad"></i></div>
             <div class="demand-preview-foot">
               <span>综合负载</span>
               <b id="previewLoadText">--</b>
@@ -92,8 +104,9 @@
           <div class="tabs" role="tablist">
             <button class="active" data-view="topology">动态拓扑</button>
             <button data-view="links">链路详情</button>
-            <button data-view="trace">单包追踪</button>
+            <button data-view="trace">任务追踪</button>
             <button data-view="data">数据采集</button>
+            <button data-view="sensing">态势感知</button>
           </div>
           <div class="topbar-legend">
             <span class="legend-dot" style="background:#f6c453"></span>云
@@ -170,6 +183,25 @@
                 <div id="dataLog" class="hop-log"></div>
               </article>
             </section>
+          </div>
+        </section>
+
+        <section id="sensingView" class="view sensing-view">
+          <div class="sensing-board">
+            <section class="sensing-map">
+              <div class="sensing-title">
+                <div>
+                  <span class="eyebrow">遥感图协同态势感知</span>
+                  <h2 id="sensingTitle">等待遥感图或仿真感知帧</h2>
+                </div>
+                <span id="sensingBadge" class="collector-badge">融合态势</span>
+              </div>
+              <canvas id="sensingCanvas" aria-label="remote sensing target sensing"></canvas>
+            </section>
+            <aside class="sensing-side">
+              <div id="tsStats" class="ts-stats"></div>
+              <div id="tsDetectionList" class="ts-detection-list"></div>
+            </aside>
           </div>
         </section>
       </section>

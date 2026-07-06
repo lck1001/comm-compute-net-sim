@@ -15,9 +15,18 @@ const MAX_PACKET_JOURNEYS = 96;
 const MAX_TELEMETRY_RECORDS = 120;
 const MAX_RELAY_LOGS = 160;
 const MAX_CLOUD_INBOX = 120;
+const MAX_EXTERNAL_PLATFORM_TRACKS = 240;
+const MAX_TS_FRAMES = 80;
+const TS_TARGET_COUNT = Number(process.env.TS_TARGET_COUNT || 9);
+const MARITIME_BOUNDS = {
+  minLat: 18.2,
+  maxLat: 22.8,
+  minLng: 111.4,
+  maxLng: 116.9
+};
 
 function defaultEdgeCount(total) {
-  return Math.min(total - 1, Math.max(10, Math.ceil(total / 3)));
+  return Math.min(Math.floor(total * MAX_EDGE_RATIO), total - 1, Math.max(10, Math.floor(total / 3)));
 }
 const MAX_EDGE_RATIO = 1 / 3;
 let EDGE_COUNT = process.env.EDGE_COUNT
@@ -50,10 +59,13 @@ const packetJourneys = [];
 const telemetryRecords = [];
 const relayLogs = [];
 const cloudInbox = [];
+const externalPlatformTracks = [];
+const tsSensingFrames = [];
 let nextTaskId = 1;
 let nextLinkId = 1;
 let nextPacketId = 1;
 let nextTelemetryId = 1;
+let nextTsFrameId = 1;
 let lastAutoTaskAt = 0;
 let tickCount = 0;
 let paused = false;
@@ -73,6 +85,14 @@ function choose(items) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function toIso(value) {
+  return value ? new Date(value).toISOString() : null;
+}
+
+function idNumber(id) {
+  return Number(String(id || '').replace(/\D/g, '')) || 0;
 }
 
 function createNodes() {
@@ -393,9 +413,8 @@ function pathPolicyScore(pathIds) {
   return clamp(score, 0.18, 1.24);
 }
 
-function findPathWithinTwoHops(originId, targetId) {
+function findPathWithinTwoHops(originId, targetId, map = neighborMap()) {
   if (originId === targetId) return [originId];
-  const map = neighborMap();
   const paths = [];
   if (map.get(originId)?.has(targetId)) paths.push([originId, targetId]);
   for (const mid of map.get(originId) || []) {
@@ -603,14 +622,22 @@ function attachPacketJourneys(task) {
 }
 
 function twoHopCandidates(originId, demand) {
-  return nodes
+  const map = neighborMap();
+  const candidateMap = new Map();
+  const addCandidate = (candidate) => {
+    if (!candidate?.node) return;
+    const previous = candidateMap.get(candidate.node.id);
+    if (!previous || candidate.score > previous.score) candidateMap.set(candidate.node.id, candidate);
+  };
+
+  nodes
     .map((node) => {
-      const path = findPathWithinTwoHops(originId, node.id);
+      const path = findPathWithinTwoHops(originId, node.id, map);
       if (!path || node.status !== 'online') return null;
       const metrics = pathMetrics(path);
       if (!metrics) return null;
       const resourceScore = node.computeFree / Math.max(1, node.computeTotal) + node.storageFree / Math.max(1, node.storageTotal);
-      const canHold = node.computeFree >= demand.compute * 0.08 && node.storageFree >= demand.storage * 0.06;
+      const canHold = node.computeFree >= demand.compute * 0.04 && node.storageFree >= demand.storage * 0.035;
       const commScore = clamp(metrics.bottleneck / 900, 0, 1.5);
       const policyScore = pathPolicyScore(path);
       return {
@@ -623,7 +650,52 @@ function twoHopCandidates(originId, demand) {
     })
     .filter(Boolean)
     .filter((candidate) => candidate.canHold)
-    .sort((left, right) => right.score - left.score);
+    .forEach(addCandidate);
+
+  // Demo-safe fallback: if the strict 2-hop neighborhood is too sparse, still allow
+  // cloud/edge execution through the known uplink path so ordinary validation tasks
+  // do not get rejected just because the chosen terminal is poorly connected.
+  const origin = getNode(originId);
+  const cloud = nodes.find((node) => node.type === 'Cloud' && node.status === 'online');
+  const fallbackNodes = [
+    ...(origin?.type === 'Terminal'
+      ? [bestGatewayForTerminal(origin), origin.backupEdgeId ? getNode(origin.backupEdgeId) : null]
+      : []),
+    ...nodes.filter((node) => node.type === 'Edge' && node.status === 'online')
+      .sort((left, right) => (right.computeFree + right.storageFree) - (left.computeFree + left.storageFree))
+      .slice(0, 8),
+    cloud
+  ].filter(Boolean);
+
+  for (const node of fallbackNodes) {
+    if (node.status !== 'online') continue;
+    if (node.computeFree < demand.compute * 0.04 || node.storageFree < demand.storage * 0.035) continue;
+    const uplink = buildUplinkRoute(originId);
+    let path = null;
+    if (node.id === originId) path = [originId];
+    else if (node.type === 'Cloud' && uplink) path = uplink;
+    else {
+      path = findPathWithinTwoHops(originId, node.id, map);
+      if (!path && origin?.type === 'Terminal' && origin.gatewayEdgeId) path = [originId, origin.gatewayEdgeId, node.id];
+      if (!path && cloud && node.type === 'Edge') path = [originId, node.id];
+    }
+    if (!path) continue;
+    for (let i = 0; i < path.length - 1; i += 1) createPhysicalLink(path[i], path[i + 1], { active: true, force: true });
+    const metrics = pathMetrics(path);
+    if (!metrics) continue;
+    const resourceScore = node.computeFree / Math.max(1, node.computeTotal) + node.storageFree / Math.max(1, node.storageTotal);
+    const commScore = clamp(metrics.bottleneck / 900, 0, 1.5);
+    const policyScore = pathPolicyScore(path);
+    addCandidate({
+      node,
+      path,
+      metrics,
+      score: resourceScore * 1.45 + commScore * 1.65 + metrics.score * 0.62 + policyScore + 0.34,
+      canHold: true
+    });
+  }
+
+  return [...candidateMap.values()].sort((left, right) => right.score - left.score);
 }
 
 function splitWeight(candidate) {
@@ -631,6 +703,53 @@ function splitWeight(candidate) {
   const storageRatio = candidate.node.storageFree / Math.max(1, candidate.node.storageTotal);
   const commRatio = clamp(candidate.metrics.bottleneck / 900, 0.05, 1.6);
   return Math.max(0.05, computeRatio * 0.42 + storageRatio * 0.28 + commRatio * 0.3);
+}
+
+function buildTaskGraph(taskId, originId, fragments, demand) {
+  const totalCompute = fragments.reduce((sum, fragment) => sum + fragment.compute, 0) || 1;
+  const graphNodes = [
+    { id: originId, role: 'origin', label: '任务发起方', ratio: 0 },
+    ...fragments.map((fragment, index) => ({
+      id: fragment.nodeId,
+      fragmentId: fragment.id,
+      role: 'compute',
+      label: `分片 ${index + 1}`,
+      ratio: Number((fragment.compute / totalCompute).toFixed(3)),
+      compute: fragment.compute,
+      storage: fragment.storage,
+      data: fragment.data
+    }))
+  ];
+  const edges = [];
+  fragments.forEach((fragment, index) => {
+    const nextFragment = fragments[(index + 1) % fragments.length];
+    edges.push({
+      id: `${taskId}-D${index + 1}`,
+      from: originId,
+      to: fragment.nodeId,
+      role: 'dispatch',
+      ratio: Number((fragment.compute / totalCompute).toFixed(3)),
+      data: fragment.data
+    });
+    if (nextFragment && (nextFragment.nodeId !== fragment.nodeId || fragments.length === 1)) {
+      edges.push({
+        id: `${taskId}-R${index + 1}`,
+        from: fragment.nodeId,
+        to: index === fragments.length - 1 ? originId : nextFragment.nodeId,
+        role: index === fragments.length - 1 ? 'gather' : 'handoff',
+        ratio: Number((fragment.compute / totalCompute).toFixed(3)),
+        data: Math.max(4, Math.round(fragment.data * 0.18))
+      });
+    }
+  });
+  return {
+    mode: 'closedDirectedGraph',
+    origin: originId,
+    demand,
+    nodes: graphNodes,
+    edges,
+    description: '首尾相接有向图：任务发起方按比例下发分片，节点计算后沿有向环传递部分结果，最后汇聚回发起方。'
+  };
 }
 
 function createTask(payload = {}) {
@@ -664,7 +783,7 @@ function createTask(payload = {}) {
     const targetStorage = splitStrategy === 'equal' ? (isLast ? remainingStorage : Math.round(remainingStorage / remainingSlots)) : weightedStorage;
     const computeSlice = Math.min(targetCompute, candidate.node.computeFree, remainingCompute);
     const storageSlice = Math.min(targetStorage, candidate.node.storageFree, remainingStorage);
-    if (computeSlice < 24 || storageSlice < 10) continue;
+    if (computeSlice < Math.min(16, demand.compute * 0.03) || storageSlice < Math.min(8, demand.storage * 0.03)) continue;
     candidate.node.computeFree -= computeSlice;
     candidate.node.storageFree -= storageSlice;
     remainingCompute -= computeSlice;
@@ -684,7 +803,11 @@ function createTask(payload = {}) {
     });
   }
 
-  const accepted = remainingCompute <= demand.compute * 0.5 && fragments.length > 0;
+  const coveredCompute = demand.compute - remainingCompute;
+  const coveredStorage = demand.storage - remainingStorage;
+  const accepted = fragments.length > 0
+    && coveredCompute >= demand.compute * 0.35
+    && coveredStorage >= demand.storage * 0.3;
 
   // Materialize links along fragment paths — links are created only when data flows
   if (accepted) {
@@ -695,8 +818,9 @@ function createTask(payload = {}) {
     }
   }
 
+  const taskId = `T${String(nextTaskId++).padStart(4, '0')}`;
   const task = {
-    id: `T${String(nextTaskId++).padStart(4, '0')}`,
+    id: taskId,
     createdAt: Date.now(),
     origin: origin.id,
     demand,
@@ -706,6 +830,7 @@ function createTask(payload = {}) {
     accepted,
     remaining: { compute: Math.max(0, remainingCompute), storage: Math.max(0, remainingStorage) },
     fragments,
+    taskGraph: buildTaskGraph(taskId, origin.id, fragments, demand),
     trace: fragments.flatMap((fragment) => fragment.path.map((nodeId, order) => ({ nodeId, order, fragmentId: fragment.id }))).slice(0, 80),
     message: accepted ? '2-hop elastic scheduling accepted' : 'insufficient resource/link quality within 2 hops'
   };
@@ -748,16 +873,20 @@ function resetSimulation(opts = {}) {
   telemetryRecords.length = 0;
   relayLogs.length = 0;
   cloudInbox.length = 0;
+  externalPlatformTracks.length = 0;
+  tsSensingFrames.length = 0;
   nextTaskId = 1;
   nextLinkId = 1;
   nextPacketId = 1;
   nextTelemetryId = 1;
+  nextTsFrameId = 1;
   lastAutoTaskAt = 0;
   tickCount = 0;
   paused = false;
   createNodes();
   applyForceLayout();
   createStableTopology();
+  createTSSensingFrame({ imageName: '初始化遥感底图' });
   createTask({ priority: '高' });
   broadcast('state', snapshot());
 }
@@ -1012,6 +1141,467 @@ function simulatePacketJourneys() {
   }
 }
 
+function dbLimit(url, fallback) {
+  const limit = Number(url.searchParams.get('limit') || fallback);
+  if (!Number.isFinite(limit) || limit <= 0) return fallback;
+  return Math.min(Math.round(limit), 1000);
+}
+
+function nodeGeo(node) {
+  const latRange = MARITIME_BOUNDS.maxLat - MARITIME_BOUNDS.minLat;
+  const lngRange = MARITIME_BOUNDS.maxLng - MARITIME_BOUNDS.minLng;
+  return {
+    latitude: Number((MARITIME_BOUNDS.minLat + (1 - node.y) * latRange).toFixed(6)),
+    longitude: Number((MARITIME_BOUNDS.minLng + node.x * lngRange).toFixed(6))
+  };
+}
+
+function geoToCanvas(latitude, longitude) {
+  const latRange = MARITIME_BOUNDS.maxLat - MARITIME_BOUNDS.minLat;
+  const lngRange = MARITIME_BOUNDS.maxLng - MARITIME_BOUNDS.minLng;
+  return {
+    x: clamp((longitude - MARITIME_BOUNDS.minLng) / lngRange, 0.02, 0.98),
+    y: clamp(1 - (latitude - MARITIME_BOUNDS.minLat) / latRange, 0.04, 0.96)
+  };
+}
+
+function sensingTargets(count = TS_TARGET_COUNT) {
+  const tracks = databaseAPlatformTracks(Math.max(count, 24))
+    .filter((track) => track.status !== 'offline')
+    .slice(0, count);
+  if (tracks.length) {
+    return tracks.map((track, index) => ({
+      id: `TS-${String(index + 1).padStart(3, '0')}`,
+      name: track.name,
+      class: track.type === 'aircraft' ? '空中目标' : '海面目标',
+      ...geoToCanvas(track.latitude, track.longitude),
+      latitude: track.latitude,
+      longitude: track.longitude,
+      speed_kn: track.speed_kn,
+      heading_deg: track.heading_deg,
+      source_track_id: track.id
+    }));
+  }
+  return nodes.slice(1, count + 1).map((node, index) => {
+    const geo = nodeGeo(node);
+    return {
+      id: `TS-${String(index + 1).padStart(3, '0')}`,
+      name: `仿真目标-${String(index + 1).padStart(3, '0')}`,
+      class: node.type === 'Edge' ? '空中目标' : '海面目标',
+      x: node.x,
+      y: node.y,
+      latitude: geo.latitude,
+      longitude: geo.longitude,
+      speed_kn: Number((6 + node.load * 18).toFixed(1)),
+      heading_deg: Number(((node.pulse * 360 + index * 29) % 360).toFixed(1)),
+      source_track_id: null
+    };
+  });
+}
+
+function sensorScore(sensor, target) {
+  const d = Math.hypot(sensor.x - target.x, sensor.y - target.y);
+  const range = sensor.type === 'Cloud' ? 0.7 : sensor.type === 'Edge' ? 0.38 : 0.22;
+  const resource = clamp(sensor.computeFree / Math.max(1, sensor.computeTotal), 0, 1);
+  const signal = clamp(1 - d / range, 0, 1);
+  return signal * 0.68 + resource * 0.22 + (sensor.status === 'online' ? 0.1 : 0);
+}
+
+function createTSSensingFrame(options = {}) {
+  const targets = sensingTargets(Number(options.targetCount || TS_TARGET_COUNT));
+  const onlineSensors = nodes.filter((node) => node.status === 'online' && node.type !== 'Cloud');
+  const edges = nodes.filter((node) => node.status === 'online' && node.type === 'Edge');
+  const detections = [];
+  for (const target of targets) {
+    const sensors = onlineSensors
+      .map((sensor) => ({ sensor, score: sensorScore(sensor, target) }))
+      .filter((item) => item.score > 0.18)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 4);
+    const fusionEdge = edges
+      .map((edge) => ({ edge, distance: Math.hypot(edge.x - target.x, edge.y - target.y) }))
+      .sort((left, right) => left.distance - right.distance)[0]?.edge || null;
+    const confidence = sensors.length
+      ? clamp(sensors.reduce((sum, item) => sum + item.score, 0) / sensors.length + Math.min(0.18, sensors.length * 0.035), 0.2, 0.99)
+      : 0.16;
+    detections.push({
+      id: `${target.id}-D${String(nextTsFrameId).padStart(4, '0')}`,
+      target,
+      sensor_nodes: sensors.map((item) => ({
+        node_id: item.sensor.id,
+        node_type: item.sensor.type,
+        confidence: Number(item.score.toFixed(3)),
+        link_path: fusionEdge ? (findPathWithinTwoHops(item.sensor.id, fusionEdge.id) || [item.sensor.id, fusionEdge.id]) : [item.sensor.id]
+      })),
+      fusion_node_id: fusionEdge?.id || 'N001',
+      confidence: Number(confidence.toFixed(3)),
+      status: confidence >= 0.72 ? 'fused' : confidence >= 0.42 ? 'tracking' : 'weak',
+      latency_ms: Math.round(18 + (1 - confidence) * 120 + sensors.length * 6),
+      evidence_count: sensors.length
+    });
+  }
+  const frame = {
+    id: `TSF${String(nextTsFrameId++).padStart(4, '0')}`,
+    createdAt: Date.now(),
+    sourceImageName: options.imageName || options.sourceImageName || '遥感图',
+    targets: detections.map((item) => item.target),
+    detections,
+    fusedCount: detections.filter((item) => item.status === 'fused').length,
+    weakCount: detections.filter((item) => item.status === 'weak').length
+  };
+  tsSensingFrames.unshift(frame);
+  while (tsSensingFrames.length > MAX_TS_FRAMES) tsSensingFrames.pop();
+  return frame;
+}
+
+function databaseATSSensing(limit = 80) {
+  return tsSensingFrames.slice(0, limit).flatMap((frame) => frame.detections.map((detection) => ({
+    frame_id: frame.id,
+    source_image_name: frame.sourceImageName,
+    target_id: detection.target.id,
+    target_name: detection.target.name,
+    target_class: detection.target.class,
+    latitude: detection.target.latitude,
+    longitude: detection.target.longitude,
+    canvas_x: Number(detection.target.x.toFixed(4)),
+    canvas_y: Number(detection.target.y.toFixed(4)),
+    fusion_node_id: detection.fusion_node_id,
+    sensor_node_ids: detection.sensor_nodes.map((sensor) => sensor.node_id),
+    evidence_count: detection.evidence_count,
+    confidence: detection.confidence,
+    status: detection.status,
+    latency_ms: detection.latency_ms,
+    sensed_at: toIso(frame.createdAt)
+  })));
+}
+
+function normalizePlatformTrack(payload = {}) {
+  const associatedNodeId = payload.associated_node_id || payload.associatedNodeId || payload.node_id || payload.nodeId;
+  const node = associatedNodeId ? getNode(associatedNodeId) : null;
+  const fallbackGeo = node ? nodeGeo(node) : {
+    latitude: (MARITIME_BOUNDS.minLat + MARITIME_BOUNDS.maxLat) / 2,
+    longitude: (MARITIME_BOUNDS.minLng + MARITIME_BOUNDS.maxLng) / 2
+  };
+  const type = ['vessel', 'aircraft', 'vehicle'].includes(payload.type) ? payload.type : 'vessel';
+  const latitude = Number(payload.latitude ?? payload.lat ?? fallbackGeo.latitude);
+  const longitude = Number(payload.longitude ?? payload.lng ?? payload.lon ?? fallbackGeo.longitude);
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+    return { error: 'invalid_latitude', message: 'latitude 需为 -90 到 90 之间的数字' };
+  }
+  if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    return { error: 'invalid_longitude', message: 'longitude 需为 -180 到 180 之间的数字' };
+  }
+  return {
+    id: String(payload.id || `${type === 'aircraft' ? 'A' : type === 'vehicle' ? 'M' : 'V'}${String(externalPlatformTracks.length + 1).padStart(3, '0')}`),
+    type,
+    name: String(payload.name || payload.callsign || (type === 'aircraft' ? '外部飞机' : '外部船只')),
+    latitude: Number(latitude.toFixed(6)),
+    longitude: Number(longitude.toFixed(6)),
+    altitude_m: Number(payload.altitude_m ?? payload.altitudeM ?? (type === 'aircraft' ? 1200 : 0)),
+    heading_deg: Number(clamp(Number(payload.heading_deg ?? payload.headingDeg ?? payload.heading ?? 0), 0, 360).toFixed(1)),
+    speed_kn: Number(Math.max(0, Number(payload.speed_kn ?? payload.speedKn ?? payload.speed ?? 0)).toFixed(1)),
+    associated_node_id: associatedNodeId ? String(associatedNodeId) : null,
+    status: ['active', 'idle', 'offline'].includes(payload.status) ? payload.status : 'active',
+    zone: String(payload.zone || node?.zone || 'A'),
+    recorded_at: toIso(payload.recorded_at || payload.recordedAt || Date.now())
+  };
+}
+
+function upsertExternalPlatformTrack(payload) {
+  const track = normalizePlatformTrack(payload);
+  if (track.error) return track;
+  const index = externalPlatformTracks.findIndex((item) => item.id === track.id);
+  if (index >= 0) {
+    externalPlatformTracks.splice(index, 1);
+  }
+  externalPlatformTracks.unshift(track);
+  while (externalPlatformTracks.length > MAX_EXTERNAL_PLATFORM_TRACKS) externalPlatformTracks.pop();
+  return track;
+}
+
+function platformTrackForNode(node, index) {
+  const geo = nodeGeo(node);
+  const isAirborne = node.type === 'Edge' && index % 9 === 0;
+  const heading = (node.pulse * 360 + idNumber(node.id) * 17 + tickCount * 3) % 360;
+  const platformPrefix = isAirborne ? 'A' : 'V';
+  const speed = isAirborne
+    ? 190 + ((idNumber(node.id) * 13 + tickCount * 7) % 140)
+    : 8 + node.load * 12 + (node.pulse % 0.35) * 10;
+  return {
+    id: `${platformPrefix}${String(index + 1).padStart(3, '0')}`,
+    type: isAirborne ? 'aircraft' : 'vessel',
+    name: isAirborne ? `海域巡航飞机-${String(index + 1).padStart(3, '0')}` : `海上移动终端-${String(index + 1).padStart(3, '0')}`,
+    latitude: geo.latitude,
+    longitude: geo.longitude,
+    altitude_m: isAirborne ? Math.round(900 + (node.pulse * 1800) % 2200) : 0,
+    heading_deg: Number(heading.toFixed(1)),
+    speed_kn: Number(speed.toFixed(1)),
+    associated_node_id: node.id,
+    status: node.status === 'offline' ? 'offline' : node.status === 'degraded' ? 'idle' : 'active',
+    zone: node.zone,
+    recorded_at: toIso(Date.now())
+  };
+}
+
+function databaseAPlatformTracks(limit = 80) {
+  const terminals = nodes.filter((node) => node.type === 'Terminal');
+  const mobileEdges = nodes.filter((node) => node.type === 'Edge').slice(0, Math.max(1, Math.floor(limit / 12)));
+  const generated = [...terminals, ...mobileEdges].map(platformTrackForNode);
+  return [...externalPlatformTracks, ...generated].slice(0, limit);
+}
+
+function databaseANodeSnapshots(limit = nodes.length) {
+  return nodes.slice(0, limit).map((node) => ({
+    node_id: node.id,
+    name: node.name,
+    type: node.type,
+    zone: node.zone,
+    latitude: nodeGeo(node).latitude,
+    longitude: nodeGeo(node).longitude,
+    x: Number(node.x.toFixed(4)),
+    y: Number(node.y.toFixed(4)),
+    compute_total: Math.round(node.computeTotal),
+    compute_free: Math.round(node.computeFree),
+    storage_total: Math.round(node.storageTotal),
+    storage_free: Math.round(node.storageFree),
+    tx_mbps: Number(node.txMbps.toFixed(2)),
+    rx_mbps: Number(node.rxMbps.toFixed(2)),
+    load: Number(node.load.toFixed(3)),
+    status: node.status,
+    gateway_edge_id: node.gatewayEdgeId || null,
+    backup_edge_id: node.backupEdgeId || null,
+    snapshot_at: toIso(Date.now())
+  }));
+}
+
+function linkAck(link) {
+  const retransmit = Math.max(0, Math.round(link.loss / 1.6 + link.utilization * 2 - 0.8));
+  const ackReceived = Boolean(link.active && link.loss < 7.5 && retransmit < 6);
+  return {
+    ack_received: ackReceived,
+    ack_latency_ms: ackReceived ? Number((link.latency * 1.85 + retransmit * 7).toFixed(1)) : null,
+    retransmit_count: retransmit,
+    rssi_dbm: ['terminal-edge', 'terminal-peer', 'flex'].includes(link.role)
+      ? Math.round(clamp(-48 - link.distance / 32 - link.loss * 2.4, -112, -38))
+      : null
+  };
+}
+
+function databaseALinkStatus(limit = links.length) {
+  return links.slice(0, limit).map((link) => ({
+    link_id: link.id,
+    node_a: link.a,
+    node_b: link.b,
+    role: link.role,
+    bandwidth_mbps: Math.round(link.bandwidth),
+    latency_ms: Number(link.latency.toFixed(1)),
+    loss_rate: Number(link.loss.toFixed(2)),
+    utilization: Number(link.utilization.toFixed(3)),
+    distance_m: Number(link.distance.toFixed(1)),
+    active: Boolean(link.active),
+    persistent: Boolean(link.persistent),
+    ...linkAck(link),
+    recorded_at: toIso(Date.now())
+  }));
+}
+
+function databaseATasks(limit = 80) {
+  return tasks.slice(0, limit).map((task) => ({
+    task_id: task.id,
+    origin_node_id: task.origin,
+    demand_compute: Math.round(task.demand.compute),
+    demand_storage: Math.round(task.demand.storage),
+    demand_data: Math.round(task.demand.data),
+    priority: task.priority,
+    split_strategy: task.splitStrategy,
+    status: task.status,
+    accepted: Boolean(task.accepted),
+    progress: Number((task.progress || 0).toFixed(3)),
+    task_graph_mode: task.taskGraph?.mode || null,
+    graph_node_count: task.taskGraph?.nodes?.length || 0,
+    graph_edge_count: task.taskGraph?.edges?.length || 0,
+    remaining_compute: Math.round(task.remaining?.compute || 0),
+    remaining_storage: Math.round(task.remaining?.storage || 0),
+    elapsed_ms: Math.round(task.elapsedMs || 0),
+    message: task.message || '',
+    created_at: toIso(task.createdAt),
+    completed_at: task.status === 'complete' ? toIso(task.createdAt + (task.elapsedMs || 0)) : null
+  }));
+}
+
+function databaseATaskFragments(limit = 160) {
+  return tasks
+    .flatMap((task) => task.fragments.map((fragment) => ({
+      fragment_id: fragment.id,
+      task_id: task.id,
+      node_id: fragment.nodeId,
+      path: fragment.path,
+      compute_slice: Math.round(fragment.compute),
+      storage_slice: Math.round(fragment.storage),
+      data_slice: Math.round(fragment.data),
+      progress: Number(fragment.progress.toFixed(3)),
+      stage: fragment.stage,
+      latency_ms: Number(fragment.latency.toFixed(1)),
+      bottleneck_mbps: Math.round(fragment.bottleneck),
+      score: Number(fragment.score.toFixed(2))
+    })))
+    .slice(0, limit);
+}
+
+function journeyHopAckMap(journey) {
+  const hopCount = Math.max(0, journey.path.length - 1);
+  const reachedHop = journey.status === 'complete' ? hopCount : Math.floor((journey.progress || 0) * hopCount);
+  const map = {};
+  for (let index = 0; index < hopCount; index += 1) {
+    const link = linkBetween(journey.path[index], journey.path[index + 1]);
+    map[`hop_${index}`] = Boolean(index < reachedHop && link && linkAck(link).ack_received);
+  }
+  return map;
+}
+
+function databaseAPacketJourneys(limit = 120) {
+  return packetJourneys.slice(0, limit).map((journey) => ({
+    packet_id: journey.id,
+    task_id: journey.taskId,
+    kind: journey.kind,
+    direction: journey.direction,
+    telemetry_id: journey.telemetryId || null,
+    label: journey.label,
+    origin_node_id: journey.origin,
+    target_node_id: journey.target,
+    path: journey.path,
+    data_mb: Math.round(journey.data),
+    priority: journey.priority,
+    progress: Number((journey.progress || 0).toFixed(3)),
+    current_hop: journey.currentHop,
+    status: journey.status,
+    latency_ms: Number((journey.latency || 0).toFixed(1)),
+    bottleneck_mbps: Math.round(journey.bottleneck || 0),
+    loss_rate: Number((journey.loss || 0).toFixed(2)),
+    hop_ack_map: journeyHopAckMap(journey),
+    created_at: toIso(journey.createdAt),
+    started_at: toIso(journey.startAt),
+    completed_at: toIso(journey.completedAt)
+  }));
+}
+
+function databaseATelemetryRecords(limit = 120) {
+  return telemetryRecords.slice(0, limit).map((record) => ({
+    record_id: record.id,
+    task_id: record.taskId,
+    packet_id: record.packetId,
+    source_node_id: record.source,
+    source_name: record.sourceName,
+    source_zone: record.sourceZone,
+    via_edge_id: record.viaEdge,
+    target_node_id: record.target,
+    path: record.path,
+    temperature: record.payload.temperature,
+    signal_strength: record.payload.signalStrength,
+    terminal_load: record.payload.terminalLoad,
+    compute_free: Math.round(record.payload.computeFree),
+    storage_free: Math.round(record.payload.storageFree),
+    sample_size_mb: Math.round(record.payload.sampleSizeMb),
+    status: record.status,
+    created_at: toIso(record.createdAt),
+    relayed_at: toIso(record.relayedAt),
+    received_at: toIso(record.receivedAt)
+  }));
+}
+
+function databaseARelayArrivalLogs(limit = 180) {
+  const relayRows = relayLogs.map((log) => {
+    const record = telemetryById(log.telemetryId);
+    return {
+      log_id: log.id,
+      log_type: 'relay',
+      telemetry_id: log.telemetryId,
+      packet_id: log.packetId,
+      task_id: log.taskId,
+      node_id: log.nodeId,
+      node_name: log.nodeName,
+      source_node_id: log.source,
+      source_zone: record?.sourceZone || null,
+      via_edge_id: log.nodeId,
+      path: record?.path?.slice(0, Math.max(1, record.path.indexOf(log.nodeId) + 1)) || [log.source, log.nodeId],
+      action: log.action,
+      latency_ms: Number((log.latency || 0).toFixed(1)),
+      bottleneck_mbps: Math.round(log.bottleneck || 0),
+      loss_rate: null,
+      payload: record?.payload || null,
+      received_at: toIso(log.receivedAt),
+      forwarded_at: toIso(log.forwardedAt)
+    };
+  });
+  const cloudRows = cloudInbox.map((item) => ({
+    log_id: item.id,
+    log_type: 'cloud_arrival',
+    telemetry_id: item.telemetryId,
+    packet_id: item.packetId,
+    task_id: item.taskId,
+    node_id: item.cloudNodeId,
+    node_name: getNode(item.cloudNodeId)?.name || '云节点',
+    source_node_id: item.source,
+    source_zone: item.sourceZone,
+    via_edge_id: item.viaEdge,
+    path: item.path,
+    action: 'received',
+    latency_ms: Number((item.latency || 0).toFixed(1)),
+    bottleneck_mbps: Math.round(item.bottleneck || 0),
+    loss_rate: Number((item.loss || 0).toFixed(2)),
+    payload: item.payload,
+    received_at: toIso(item.receivedAt),
+    forwarded_at: null
+  }));
+  return [...relayRows, ...cloudRows]
+    .sort((left, right) => Date.parse(right.received_at || 0) - Date.parse(left.received_at || 0))
+    .slice(0, limit);
+}
+
+function databaseASnapshot(url) {
+  const limit = dbLimit(url, 200);
+  return {
+    database: 'A',
+    generated_at: toIso(Date.now()),
+    scenario: '海上移动终端上行态势监控',
+    tables: {
+      platform_tracks: databaseAPlatformTracks(Math.min(limit, 120)),
+      node_snapshots: databaseANodeSnapshots(limit),
+      link_status: databaseALinkStatus(limit),
+      tasks: databaseATasks(Math.min(limit, 120)),
+      task_fragments: databaseATaskFragments(Math.min(limit, 240)),
+      packet_journeys: databaseAPacketJourneys(Math.min(limit, 160)),
+      telemetry_records: databaseATelemetryRecords(Math.min(limit, 160)),
+      relay_arrival_logs: databaseARelayArrivalLogs(Math.min(limit, 240)),
+      ts_sensing: databaseATSSensing(Math.min(limit, 160))
+    }
+  };
+}
+
+function databaseAInterfaces() {
+  return {
+    database: 'A',
+    note: '以下接口只返回仿真内存态，不写入数据库；字段使用数据库 A 表结构命名。',
+    endpoints: [
+      { method: 'GET', path: '/api/database-a', description: '一次性返回 8 类表结构数据', query: { limit: '每类数据最大返回条数，默认 200，最大 1000' } },
+      { method: 'GET', path: '/api/database-a/platform-tracks', description: '移动载体轨迹：船只/飞机位置、航向、航速、关联通信节点' },
+      { method: 'POST', path: '/api/platform-tracks', description: '外部系统上报船只/飞机位置，保存在仿真内存态中' },
+      { method: 'GET', path: '/api/database-a/node-snapshots', description: '云边端节点资源和在线状态快照' },
+      { method: 'GET', path: '/api/database-a/link-status', description: '通信链路带宽、时延、丢包、ACK、重传和 RSSI' },
+      { method: 'GET', path: '/api/database-a/tasks', description: '任务记录：算力/存储/数据需求量、优先级、调度状态' },
+      { method: 'GET', path: '/api/database-a/task-fragments', description: '任务分片：节点分配、路径、进度、瓶颈带宽' },
+      { method: 'GET', path: '/api/database-a/packet-journeys', description: '上行态势与下行控制指令逐跳追踪和 ACK' },
+      { method: 'GET', path: '/api/database-a/telemetry-records', description: '终端上行态势采样数据' },
+      { method: 'GET', path: '/api/database-a/relay-arrival-logs', description: '边缘中转记录与云端入库记录合并表' },
+      { method: 'GET', path: '/api/database-a/ts-sensing', description: '遥感图协同态势感知：目标、传感节点、融合节点、置信度' },
+      { method: 'POST', path: '/api/ts-sensing/scan', description: '基于当前遥感图名称触发一次协同态势感知帧生成' },
+      { method: 'GET', path: '/api/export/nodes?format=csv', description: '导出节点快照，format 支持 json/csv' },
+      { method: 'GET', path: '/api/export/links?format=csv', description: '导出链路状态，format 支持 json/csv' },
+      { method: 'GET', path: '/api/export/tasks?format=csv', description: '导出任务和分片状态，format 支持 json/csv' }
+    ]
+  };
+}
+
 function snapshot() {
   const onlineNodes = nodes.filter((node) => node.status === 'online').length;
   const activeLinks = links.filter((link) => link.active).length;
@@ -1041,6 +1631,9 @@ function snapshot() {
       telemetryRecords: telemetryRecords.length,
       relayLogs: relayLogs.length,
       cloudInbox: cloudInbox.length,
+      tsFrames: tsSensingFrames.length,
+      tsDetections: tsSensingFrames[0]?.detections.length || 0,
+      tsFused: tsSensingFrames[0]?.fusedCount || 0,
       completeTasks: tasks.filter((task) => task.status === 'complete').length,
       rejectedTasks: tasks.filter((task) => task.status === 'rejected').length
     },
@@ -1055,7 +1648,8 @@ function snapshot() {
     packetJourneys: packetJourneys.slice(0, 32),
     telemetryRecords: telemetryRecords.slice(0, 48),
     relayLogs: relayLogs.slice(0, 64),
-    cloudInbox: cloudInbox.slice(0, 48)
+    cloudInbox: cloudInbox.slice(0, 48),
+    tsSensingFrames: tsSensingFrames.slice(0, 12)
   };
 }
 
@@ -1071,6 +1665,7 @@ function step() {
   simulateNodes();
   simulateTasks();
   simulatePacketJourneys();
+  if (tickCount % 4 === 0) createTSSensingFrame({ imageName: tsSensingFrames[0]?.sourceImageName || '遥感图' });
   const now = Date.now();
   if (now - lastAutoTaskAt > TASK_INTERVAL_MS) {
     lastAutoTaskAt = now;
@@ -1088,6 +1683,54 @@ function json(res, status, payload) {
     'cache-control': 'no-store'
   });
   res.end(body);
+}
+
+function csvValue(value) {
+  if (Array.isArray(value) || (value && typeof value === 'object')) value = JSON.stringify(value);
+  const text = value === undefined || value === null ? '' : String(value);
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+}
+
+function rowsToCsv(rows) {
+  if (!rows.length) return '';
+  const headers = Object.keys(rows[0]);
+  return [
+    headers.join(','),
+    ...rows.map((row) => headers.map((header) => csvValue(row[header])).join(','))
+  ].join('\n');
+}
+
+function exportRows(kind, url) {
+  const limit = dbLimit(url, 1000);
+  if (kind === 'nodes') return databaseANodeSnapshots(limit);
+  if (kind === 'links') return databaseALinkStatus(limit);
+  if (kind === 'tasks') return databaseATasks(limit);
+  if (kind === 'task-fragments') return databaseATaskFragments(limit);
+  if (kind === 'telemetry') return databaseATelemetryRecords(limit);
+  if (kind === 'ts-sensing') return databaseATSSensing(limit);
+  return null;
+}
+
+function exportResponse(res, url, kind) {
+  const rows = exportRows(kind, url);
+  if (!rows) return json(res, 404, { error: 'unknown_export', message: '未知导出类型' });
+  const format = (url.searchParams.get('format') || 'json').toLowerCase();
+  if (format === 'csv') {
+    const body = rowsToCsv(rows);
+    res.writeHead(200, {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-disposition': `attachment; filename="${kind}.csv"`,
+      'cache-control': 'no-store'
+    });
+    res.end(body);
+    return null;
+  }
+  return json(res, 200, {
+    exported_at: toIso(Date.now()),
+    kind,
+    count: rows.length,
+    rows
+  });
 }
 
 async function readBody(req) {
@@ -1122,6 +1765,33 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.pathname === '/api/state' && req.method === 'GET') return json(res, 200, snapshot());
+    if (url.pathname === '/api/database-a/interfaces' && req.method === 'GET') return json(res, 200, databaseAInterfaces());
+    if (url.pathname === '/api/database-a' && req.method === 'GET') return json(res, 200, databaseASnapshot(url));
+    if (url.pathname === '/api/database-a/platform-tracks' && req.method === 'GET') return json(res, 200, databaseAPlatformTracks(dbLimit(url, 120)));
+    if (url.pathname === '/api/database-a/node-snapshots' && req.method === 'GET') return json(res, 200, databaseANodeSnapshots(dbLimit(url, nodes.length)));
+    if (url.pathname === '/api/database-a/link-status' && req.method === 'GET') return json(res, 200, databaseALinkStatus(dbLimit(url, links.length)));
+    if (url.pathname === '/api/database-a/tasks' && req.method === 'GET') return json(res, 200, databaseATasks(dbLimit(url, 120)));
+    if (url.pathname === '/api/database-a/task-fragments' && req.method === 'GET') return json(res, 200, databaseATaskFragments(dbLimit(url, 240)));
+    if (url.pathname === '/api/database-a/packet-journeys' && req.method === 'GET') return json(res, 200, databaseAPacketJourneys(dbLimit(url, 160)));
+    if (url.pathname === '/api/database-a/telemetry-records' && req.method === 'GET') return json(res, 200, databaseATelemetryRecords(dbLimit(url, 160)));
+    if (url.pathname === '/api/database-a/relay-arrival-logs' && req.method === 'GET') return json(res, 200, databaseARelayArrivalLogs(dbLimit(url, 240)));
+    if (url.pathname === '/api/database-a/ts-sensing' && req.method === 'GET') return json(res, 200, databaseATSSensing(dbLimit(url, 160)));
+    if (url.pathname.startsWith('/api/export/') && req.method === 'GET') {
+      return exportResponse(res, url, url.pathname.replace('/api/export/', ''));
+    }
+    if (url.pathname === '/api/platform-tracks' && req.method === 'POST') {
+      const body = await readBody(req);
+      const track = upsertExternalPlatformTrack(body);
+      if (track.error) return json(res, 400, track);
+      broadcast('state', snapshot());
+      return json(res, 201, track);
+    }
+    if (url.pathname === '/api/ts-sensing/scan' && req.method === 'POST') {
+      const body = await readBody(req);
+      const frame = createTSSensingFrame(body);
+      broadcast('state', snapshot());
+      return json(res, 201, frame);
+    }
     if (url.pathname === '/api/tasks' && req.method === 'GET') return json(res, 200, tasks.slice(0, 30));
     if (url.pathname === '/api/tasks' && req.method === 'POST') {
       const body = await readBody(req);
@@ -1183,6 +1853,7 @@ const server = http.createServer(async (req, res) => {
 createNodes();
 applyForceLayout();
 createStableTopology();
+createTSSensingFrame({ imageName: '初始化遥感底图' });
 createTask({ priority: '高' });
 setInterval(step, TICK_MS);
 server.listen(PORT, '0.0.0.0', () => {
