@@ -21,7 +21,11 @@
   editingEdgeCount: false,
   edgeCountTouched: false,
   mouse: { x: 0, y: 0, inside: false },
+  sensingMouse: { x: 0, y: 0, inside: false },
   nodeScreen: new Map(),
+  topologyViewport: { zoom: 1, cx: 0.5, cy: 0.5 },
+  sensingHitNodes: [],
+  sensingFlowAnimation: { recordId: null, startedAt: 0 },
   tick: 0,
   lastFrame: 0,
   remoteImage: null,
@@ -32,6 +36,7 @@ const el = {
   clock: document.querySelector('#clock'),
   nodeCount: document.querySelector('#nodeCount'),
   activeLinks: document.querySelector('#activeLinks'),
+  selfOrganizedLinks: document.querySelector('#selfOrganizedLinks'),
   avgUtil: document.querySelector('#avgUtil'),
   runningTasks: document.querySelector('#runningTasks'),
   nodeTypeBreakdown: document.querySelector('#nodeTypeBreakdown'),
@@ -57,6 +62,7 @@ const el = {
   resetSim: document.querySelector('#resetSim'),
   togglePause: document.querySelector('#togglePause'),
   taskList: document.querySelector('#taskList'),
+  linkStats: document.querySelector('#linkStats'),
   linkRows: document.querySelector('#linkRows'),
   fragmentList: document.querySelector('#fragmentList'),
   traceTitle: document.querySelector('#traceTitle'),
@@ -73,6 +79,7 @@ const el = {
   tsDetectionList: document.querySelector('#tsDetectionList'),
   sensingTitle: document.querySelector('#sensingTitle'),
   sensingBadge: document.querySelector('#sensingBadge'),
+  sensingHoverCard: document.querySelector('#sensingHoverCard'),
   hoverTip: document.querySelector('#hoverTip'),
   nodePopup: document.querySelector('#nodePopup'),
   networkCanvas: document.querySelector('#networkCanvas'),
@@ -103,11 +110,34 @@ function timeLabel(ts) {
   return ts ? new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) : '--';
 }
 
+function durationLabel(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '--';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`;
+  const minutes = Math.floor(ms / 60000);
+  const seconds = Math.round((ms % 60000) / 1000);
+  return `${minutes}分${String(seconds).padStart(2, '0')}秒`;
+}
+
 function splitLabel(strategy) {
   return strategy === 'resourceWeighted' ? '资源权重' : '默认均分';
 }
 
-function linkRoleLabel(role) {
+function linkRoleLabel(role, link = null) {
+  if (link) {
+    const aType = nodeById(link.a)?.type;
+    const bType = nodeById(link.b)?.type;
+    if ((aType === 'Terminal' && bType === 'Edge') || (aType === 'Edge' && bType === 'Terminal')) {
+      return '端-边协同链路';
+    }
+    if (aType === 'Edge' && bType === 'Edge') {
+      return '边-边互联链路';
+    }
+    if (aType === 'Terminal' && bType === 'Terminal') {
+      return '端-端自组网';
+    }
+  }
+
   const labels = {
     'terminal-edge': '端-边主链路',
     'edge-cloud': '边-云主链路',
@@ -115,7 +145,8 @@ function linkRoleLabel(role) {
     'terminal-peer': '终端邻近',
     'terminal-cloud-exception': '端-云弹性'
   };
-  return labels[role] || '灵活链路';
+  const base = labels[role] || '灵活链路';
+  return link?.selfOrganized ? `自组·${base}` : base;
 }
 
 function selectedTask() {
@@ -225,9 +256,31 @@ function shortText(text, length = 72) {
   return value.length > length ? `${value.slice(0, length)}...` : value || '--';
 }
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[char]));
+}
+
+function compactSituationText(text, length = 72) {
+  let value = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!value) return '暂无态势描述';
+  value = value
+    .replace(/^.*?拍摄到遥感画面[:：]?\s*/, '')
+    .replace(/^.*?采集到态势数据[:：]?\s*/, '')
+    .replace(/[；;]\s*请经.*$/, '')
+    .replace(/请经.*$/, '');
+  const firstSentence = value.match(/^.+?[。！？.!?]/)?.[0] || value;
+  return firstSentence.length > length ? `${firstSentence.slice(0, length)}...` : firstSentence;
+}
+
 function defaultSituationDescription(source) {
   const id = source?.id || '终端节点';
-  return `${id} 拍摄到遥感画面：图中可见海域背景、多条态势航迹线和若干目标标注，疑似存在海面/空中平台协同行动；请经边缘节点回传至云端进行态势融合展示。`;
+  return `${id} 采集到态势数据：图中可见海域背景、多条态势航迹线和若干目标标注，疑似存在海面/空中平台协同行动；请经边缘节点回传至云端进行态势融合展示。`;
 }
 
 function fillDefaultSituationDescription(force = false) {
@@ -254,6 +307,7 @@ function updateSummary() {
   const s = state.summary || {};
   el.nodeCount.textContent = fmt(s.nodeCount);
   el.activeLinks.textContent = `${fmt(s.activeLinks)}/${fmt(s.totalLinks)}`;
+  if (el.selfOrganizedLinks) el.selfOrganizedLinks.textContent = `${fmt(s.activeSelfOrganizedLinks)}/${fmt(s.selfOrganizedLinks)}`;
   el.avgUtil.textContent = percent(s.avgUtilization);
   el.runningTasks.textContent = fmt(s.runningTasks);
   const types = s.nodeTypes || {};
@@ -293,19 +347,35 @@ function renderSituationSourceOptions() {
   const previous = el.situationSourceSelect.value;
   const terminals = state.nodes
     .filter((node) => node.type === 'Terminal' && node.status === 'online')
-    .sort((left, right) => (right.computeFree + right.storageFree) - (left.computeFree + left.storageFree));
+    .sort((left, right) => {
+      const leftMultiHop = left.multiHopRelay ? 1 : 0;
+      const rightMultiHop = right.multiHopRelay ? 1 : 0;
+      if (leftMultiHop !== rightMultiHop) return rightMultiHop - leftMultiHop;
+      return (right.computeFree + right.storageFree) - (left.computeFree + left.storageFree);
+    });
   const candidates = terminals.length ? terminals : state.nodes.filter((node) => node.type !== 'Cloud');
-  const signature = candidates.map((node) => `${node.id}:${node.gatewayEdgeId || ''}:${node.status}`).join('|');
+  const signature = candidates.map((node) => `${node.id}:${node.gatewayEdgeId || ''}:${node.multiHopRelay?.mode || ''}:${node.status}`).join('|');
   if (signature === state.situationSourceOptionsKey) {
     if (candidates.some((node) => node.id === previous)) el.situationSourceSelect.value = previous;
     return;
   }
   state.situationSourceOptionsKey = signature;
   el.situationSourceSelect.innerHTML = candidates
-    .map((node) => `<option value="${node.id}">${node.id} · ${node.label}${node.gatewayEdgeId ? ` → ${node.gatewayEdgeId}` : ''}</option>`)
+    .map((node) => {
+      const relay = node.multiHopRelay;
+      const routeLabel = relay?.mode === 'terminal-terminal-edge-cloud'
+        ? `3跳稀有 · 端-端-边-云 · ${node.id} → ${relay.relayTerminalId} → ${relay.gatewayEdgeId} → 云`
+        : relay?.mode === 'terminal-edge-edge-cloud'
+          ? `3跳稀有 · 端-边-边-云 · ${node.id} → ${relay.gatewayEdgeId} → ${relay.relayEdgeId} → 云`
+          : `${node.label}${node.gatewayEdgeId ? ` → ${node.gatewayEdgeId}` : ''}`;
+      return `<option value="${node.id}">${node.id} · ${routeLabel}</option>`;
+    })
     .join('');
   if (candidates.some((node) => node.id === previous)) el.situationSourceSelect.value = previous;
-  else if (candidates[0]) el.situationSourceSelect.value = candidates[0].id;
+  else {
+    const preferred = candidates.find((node) => node.multiHopRelay) || candidates[0];
+    if (preferred) el.situationSourceSelect.value = preferred.id;
+  }
   fillDefaultSituationDescription();
 }
 
@@ -372,12 +442,22 @@ function renderNodePopup(node, point, rect) {
   const active = state.links.filter((link) => link.active && (link.a === node.id || link.b === node.id));
   const totalLinkBandwidth = active.reduce((sum, link) => sum + link.bandwidth, 0);
   const avgCapacity = active.length ? active.reduce((sum, link) => sum + link.bandwidth * (1 - link.utilization), 0) / active.length : 0;
+  const relay = node.multiHopRelay;
+  const routeText = relay?.mode === 'terminal-terminal-edge-cloud'
+    ? `${node.id}→${relay.relayTerminalId}→${relay.gatewayEdgeId}→云`
+    : relay?.mode === 'terminal-edge-edge-cloud'
+      ? `${node.id}→${relay.gatewayEdgeId}→${relay.relayEdgeId}→云`
+      : node.type === 'Terminal'
+        ? `${node.id}→${node.gatewayEdgeId || '边缘'}→云`
+        : node.type === 'Edge'
+          ? `${node.id}→云`
+          : '云端';
   const cloudItems = node.type === 'Cloud' ? recentCloudInbox(node.id) : [];
   const relayItems = node.type === 'Edge' ? recentRelayLogs(node.id) : [];
   const telemetryItems = node.type === 'Terminal' ? recentTelemetryFrom(node.id) : [];
   // Position popup away from node to avoid blocking canvas mousemove
-  const popupW = 316, popupH = 372, gap = 18;
-  const nodeRadius = node.type === 'Cloud' ? 10 : node.type === 'Edge' ? 8 : 6;
+  const popupW = 316, popupH = 398, gap = 18;
+  const nodeRadius = node.type === 'Cloud' ? 14 : node.type === 'Edge' ? 10 : 7;
   const flipX = point.x > rect.width * 0.5;
   const flipY = point.y > rect.height * 0.55;
   const left = flipX
@@ -393,6 +473,7 @@ function renderNodePopup(node, point, rect) {
     node.status,
     node.computeFree,
     node.storageFree,
+    routeText,
     Math.round(totalLinkBandwidth),
     Math.round(avgCapacity),
     cloudItems.map((item) => `${item.telemetryId}:${item.receivedAt}`).join(','),
@@ -438,31 +519,74 @@ function renderNodePopup(node, point, rect) {
     <div class="popup-grid">
       <span><b>节点编号</b><em>${node.id}</em></span>
       <span><b>节点类型</b><em>${node.label}</em></span>
+      <span><b>单位名称</b><em>${node.unitName || node.name || '--'}</em></span>
+      <span><b>兵种</b><em>${node.branch || '--'}</em></span>
+      <span><b>经度</b><em>${fmt(node.longitude, 6)}</em></span>
+      <span><b>纬度</b><em>${fmt(node.latitude, 6)}</em></span>
       <span><b>剩余算力</b><em>${fmt(node.computeFree)} / ${fmt(node.computeTotal)}</em></span>
       <span><b>剩余存储</b><em>${fmt(node.storageFree)} / ${fmt(node.storageTotal)}</em></span>
       <span><b>通信容量</b><em>${fmt(avgCapacity)} Mbps</em></span>
       <span><b>所在链路容量</b><em>${fmt(totalLinkBandwidth)} Mbps</em></span>
+      <span><b>回传路径</b><em>${escapeHtml(routeText)}</em></span>
     </div>
     ${telemetryPanel}`;
   el.nodePopup.classList.remove('hidden');
 }
 
 function renderLinksTable() {
+  renderLinkStats();
   const rows = [...state.links]
     .sort((a, b) => Number(b.active) - Number(a.active) || b.utilization - a.utilization)
     .slice(0, 160);
   el.linkRows.innerHTML = rows
-    .map((link) => `<tr>
+    .map((link) => {
+      const na = nodeById(link.a);
+      const nb = nodeById(link.b);
+      const ha = na?.hopsToCloud ?? '--';
+      const hb = nb?.hopsToCloud ?? '--';
+      const hopLabel = ha === 0 || hb === 0 ? '直连' : '多跳';
+      return `<tr>
       <td>${link.id}</td>
       <td>${link.a} ⇄ ${link.b}</td>
-      <td>${linkRoleLabel(link.role)}</td>
+      <td>${linkRoleLabel(link.role, link)}</td>
+      <td><b>${ha}↔${hb}</b> <em>${hopLabel}</em></td>
       <td>${fmt(link.bandwidth)}</td>
       <td>${fmt(link.latency)}</td>
       <td>${fmt(link.loss, 2)}</td>
       <td>${percent(link.utilization)}</td>
       <td>${link.active ? '在线' : '中断'}</td>
-    </tr>`)
+    </tr>`;
+    })
     .join('');
+}
+
+function linkHopLabel(link) {
+  const na = nodeById(link.a);
+  const nb = nodeById(link.b);
+  return (na?.hopsToCloud === 0 || nb?.hopsToCloud === 0) ? 'direct' : 'multiHop';
+}
+
+function renderLinkStats() {
+  if (!el.linkStats) return;
+  const links = state.links || [];
+  const total = links.length;
+  const active = links.filter((link) => link.active).length;
+  const direct = links.filter((link) => linkHopLabel(link) === 'direct').length;
+  const multiHop = total - direct;
+  const selfOrganized = links.filter((link) => link.selfOrganized).length;
+  const wired = links.filter((link) => link.medium === 'wired').length;
+  const wireless = links.filter((link) => link.medium === 'wireless').length;
+  const cards = [
+    ['链路总数', fmt(total), `${fmt(active)} 在线 / ${fmt(total - active)} 中断`],
+    ['直连链路', fmt(direct), '包含云端端点的链路'],
+    ['多跳链路', fmt(multiHop), '端-边、边-边、端-端链路'],
+    ['自组链路', fmt(selfOrganized), `有线 ${fmt(wired)} / 无线 ${fmt(wireless)}`]
+  ];
+  el.linkStats.innerHTML = cards.map(([label, value, hint]) => `<article class="link-stat-card">
+    <b>${value}</b>
+    <span>${label}</span>
+    <em>${hint}</em>
+  </article>`).join('');
 }
 
 function renderFragments(task) {
@@ -616,7 +740,7 @@ function drawDataCollection(time = 0) {
 
     dataCtx.fillStyle = '#70a7ff';
     dataCtx.beginPath();
-    dataCtx.arc(terminalX, y, 6, 0, Math.PI * 2);
+    dataCtx.arc(terminalX, y, 4.5, 0, Math.PI * 2);
     dataCtx.fill();
     dataCtx.fillStyle = '#aebcbb';
     dataCtx.font = '12px Segoe UI, sans-serif';
@@ -624,9 +748,8 @@ function drawDataCollection(time = 0) {
   });
 
   edgePoints.forEach((point) => {
-    dataCtx.fillStyle = '#41d6a6';
-    dataCtx.beginPath();
-    dataCtx.arc(point.x, point.y, 9, 0, Math.PI * 2);
+    dataCtx.fillStyle = '#e0555a';
+    drawTriangle(dataCtx, point.x, point.y, 9);
     dataCtx.fill();
     dataCtx.fillStyle = '#dce5e4';
     dataCtx.font = '12px Segoe UI, sans-serif';
@@ -636,8 +759,7 @@ function drawDataCollection(time = 0) {
   dataCtx.fillStyle = '#f6c453';
   dataCtx.shadowColor = '#f6c453';
   dataCtx.shadowBlur = 18;
-  dataCtx.beginPath();
-  dataCtx.arc(cloudX, rect.height / 2, 18, 0, Math.PI * 2);
+  drawStar(dataCtx, cloudX, rect.height / 2, 18, 18 * 0.38);
   dataCtx.fill();
   dataCtx.shadowBlur = 0;
   dataCtx.fillStyle = '#dce5e4';
@@ -710,6 +832,474 @@ function tsPoint(item, rect) {
   };
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function sensingRoutePoints(path, rect, nodeMap) {
+  const nodes = (path || []).map((nodeId) => nodeMap.get(nodeId)).filter(Boolean);
+  const typeTotals = nodes.reduce((acc, node) => {
+    acc[node.type] = (acc[node.type] || 0) + 1;
+    return acc;
+  }, {});
+  const typeSeen = {};
+  const anchors = {
+    Cloud: { x: 0.18, y: 0.24 },
+    Edge: { x: 0.52, y: 0.46 },
+    Terminal: { x: 0.82, y: 0.66 }
+  };
+  const spread = clamp(Math.min(rect.width, rect.height) * 0.1, 54, 92);
+  const pad = 54;
+
+  return nodes.map((node, index) => {
+    const anchor = anchors[node.type] || {
+      x: 0.28 + (0.48 * index) / Math.max(1, nodes.length - 1),
+      y: 0.3 + (0.34 * index) / Math.max(1, nodes.length - 1)
+    };
+    const typeIndex = typeSeen[node.type] || 0;
+    typeSeen[node.type] = typeIndex + 1;
+    const offset = typeIndex - ((typeTotals[node.type] || 1) - 1) / 2;
+    const direction = node.type === 'Cloud'
+      ? { x: 0.7, y: 0.45 }
+      : node.type === 'Terminal'
+        ? { x: -0.5, y: 0.62 }
+        : { x: 0.62, y: -0.72 };
+    return {
+      node,
+      point: {
+        x: clamp(anchor.x * rect.width + offset * spread * direction.x, pad, rect.width - pad),
+        y: clamp(anchor.y * rect.height + offset * spread * direction.y, pad, rect.height - pad)
+      }
+    };
+  });
+}
+
+function sensingHitRadius(node) {
+  if (node.type === 'Cloud') return 22;
+  if (node.type === 'Edge') return 18;
+  return 16;
+}
+
+function hoveredSensingNode() {
+  if (!state.sensingMouse.inside) return null;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const item of state.sensingHitNodes) {
+    const d = Math.hypot(item.point.x - state.sensingMouse.x, item.point.y - state.sensingMouse.y);
+    if (d <= item.radius && d < nearestDistance) {
+      nearest = item;
+      nearestDistance = d;
+    }
+  }
+  return nearest;
+}
+
+function sensingPathStatus(node, situation) {
+  if (!situation) return '--';
+  const inbox = inboxForTelemetry(situation.id);
+  const relayAtNode = state.relayLogs.find((log) => log.telemetryId === situation.id && log.nodeId === node.id);
+  if (node.type === 'Cloud') return inbox ? `已入云 ${timeLabel(inbox.receivedAt)}` : '等待云端接收';
+  if (node.type === 'Edge') return relayAtNode ? `已中转 ${timeLabel(relayAtNode.receivedAt)}` : '边缘中转待达';
+  return '终端拍摄上传';
+}
+
+function situationFusionTiming(situation, packet, inbox, relay) {
+  if (!situation) {
+    return {
+      startAt: null,
+      relayAt: null,
+      cloudAt: null,
+      elapsedMs: null,
+      transportMs: null,
+      status: '等待采集',
+      done: false
+    };
+  }
+  const startAt = situation.payload?.capturedAt || situation.createdAt || packet?.createdAt || null;
+  const relayAt = relay?.receivedAt || situation.relayedAt || null;
+  const cloudAt = inbox?.receivedAt || situation.receivedAt || packet?.completedAt || null;
+  const endAt = cloudAt || Date.now();
+  const elapsedMs = startAt ? Math.max(0, endAt - startAt) : null;
+  const transportStart = packet?.startAt || startAt;
+  const transportMs = transportStart && cloudAt ? Math.max(0, cloudAt - transportStart) : packet?.latency || null;
+  return {
+    startAt,
+    relayAt,
+    cloudAt,
+    elapsedMs,
+    transportMs,
+    status: cloudAt ? '云端已形成态势图' : relayAt ? '云端融合中' : packet?.status === 'waiting' ? '等待上行' : '上行回传中',
+    done: Boolean(cloudAt)
+  };
+}
+
+function routeModeLabel(path) {
+  if (!Array.isArray(path) || path.length < 2) return '--';
+  return path.length === 2 ? '直连' : `多跳 ${path.length - 1} 跳`;
+}
+
+function drawPathModeLabel(context, rect, label) {
+  if (!label || label === '--') return;
+  context.save();
+  context.font = '800 12px Segoe UI, sans-serif';
+  const width = context.measureText(label).width + 22;
+  const height = 26;
+  const left = Math.max(14, rect.width - width - 18);
+  const top = 14;
+  context.fillStyle = label === '直连' ? 'rgba(112, 167, 255, 0.95)' : 'rgba(246, 196, 83, 0.95)';
+  context.strokeStyle = 'rgba(255, 255, 255, 0.36)';
+  context.lineWidth = 1;
+  if (typeof context.roundRect === 'function') {
+    context.beginPath();
+    context.roundRect(left, top, width, height, 13);
+    context.fill();
+    context.stroke();
+  } else {
+    context.fillRect(left, top, width, height);
+    context.strokeRect(left, top, width, height);
+  }
+  context.fillStyle = label === '直连' ? '#06100e' : '#10100a';
+  context.textAlign = 'center';
+  context.textBaseline = 'middle';
+  context.fillText(label, left + width / 2, top + height / 2 + 0.5);
+  context.restore();
+}
+
+function wrapCanvasText(context, text, maxWidth, maxLines = 3) {
+  const source = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!source) return [];
+  const chars = [...source];
+  const lines = [];
+  let line = '';
+  for (const char of chars) {
+    const next = `${line}${char}`;
+    if (context.measureText(next).width <= maxWidth || !line) {
+      line = next;
+      continue;
+    }
+    lines.push(line);
+    line = char;
+    if (lines.length >= maxLines) break;
+  }
+  if (line && lines.length < maxLines) lines.push(line);
+  if (lines.length === maxLines && chars.join('').length > lines.join('').length) {
+    lines[lines.length - 1] = `${lines[lines.length - 1].slice(0, Math.max(0, lines[lines.length - 1].length - 2))}...`;
+  }
+  return lines;
+}
+
+function clampFlowPopupPosition(x, y, width, height, rect) {
+  return {
+    x: clamp(x, 16, Math.max(16, rect.width - width - 16)),
+    y: clamp(y, 16, Math.max(16, rect.height - height - 16))
+  };
+}
+
+function popupWindowAlpha(elapsed, start, end, fade = 320) {
+  if (elapsed < start) return 0;
+  if (Number.isFinite(end) && elapsed > end) return 0;
+  const fadeIn = clamp((elapsed - start) / fade, 0, 1);
+  const fadeOut = Number.isFinite(end) ? clamp((end - elapsed) / fade, 0, 1) : 1;
+  return Math.min(fadeIn, fadeOut);
+}
+
+function drawSensingFlowPopup(context, rect, popup) {
+  if (popup.alpha <= 0) return;
+  context.save();
+  context.font = '800 15px Segoe UI, Microsoft YaHei, sans-serif';
+  const width = popup.width || 330;
+  const lines = wrapCanvasText(context, popup.text, width - 28, popup.maxLines || 4);
+  const lineHeight = 23;
+  const height = Math.max(58, 24 + lines.length * lineHeight);
+  const pos = clampFlowPopupPosition(popup.x, popup.y, width, height, rect);
+
+  context.globalAlpha = popup.alpha;
+  context.fillStyle = 'rgba(7, 18, 26, 0.88)';
+  context.strokeStyle = 'rgba(112, 167, 255, 0.5)';
+  context.lineWidth = 1.2;
+  context.shadowColor = 'rgba(67, 185, 255, 0.28)';
+  context.shadowBlur = 16;
+  if (typeof context.roundRect === 'function') {
+    context.beginPath();
+    context.roundRect(pos.x, pos.y, width, height, 8);
+    context.fill();
+    context.stroke();
+  } else {
+    context.fillRect(pos.x, pos.y, width, height);
+    context.strokeRect(pos.x, pos.y, width, height);
+  }
+
+  context.shadowBlur = 0;
+  context.fillStyle = '#43b9ff';
+  context.textAlign = 'left';
+  context.textBaseline = 'top';
+  lines.forEach((line, index) => {
+    context.fillText(line, pos.x + 14, pos.y + 14 + index * lineHeight);
+  });
+  context.restore();
+}
+
+function sensingFlowAnimation(recordId, time) {
+  if (state.sensingFlowAnimation.recordId !== recordId) {
+    state.sensingFlowAnimation = { recordId, startedAt: time };
+  }
+  const elapsed = Math.max(0, time - state.sensingFlowAnimation.startedAt);
+  return { elapsed };
+}
+
+function flowPopupDuration(node, index, isLast) {
+  if (isLast || node.type === 'Cloud') return 3000;
+  if (node.type === 'Edge') return 3300;
+  return index === 0 ? 2600 : 2200;
+}
+
+function flowSegmentDuration(from, to) {
+  const distancePx = Math.hypot((to.point.x - from.point.x), (to.point.y - from.point.y));
+  return clamp(1300 + distancePx * 2.2, 1500, 2300);
+}
+
+function sensingFlowTimeline(points) {
+  const events = [];
+  let cursor = 0;
+  points.forEach((item, index) => {
+    const isLast = index === points.length - 1;
+    const popupDuration = flowPopupDuration(item.node, index, isLast);
+    events.push({
+      type: 'popup',
+      index,
+      start: cursor,
+      end: cursor + popupDuration
+    });
+    cursor += popupDuration;
+    if (!isLast) {
+      const flowDuration = flowSegmentDuration(item, points[index + 1]);
+      events.push({
+        type: 'flow',
+        from: index,
+        to: index + 1,
+        start: cursor,
+        end: cursor + flowDuration
+      });
+      cursor += flowDuration;
+    }
+  });
+  return { events, duration: cursor };
+}
+
+function drawPartialSegment(context, a, b, progress, color, width = 3) {
+  if (!a || !b || progress <= 0) return;
+  const p = clamp(progress, 0, 1);
+  context.save();
+  context.globalAlpha = 0.86;
+  context.strokeStyle = color;
+  context.shadowColor = color;
+  context.shadowBlur = 12;
+  context.lineWidth = width;
+  context.beginPath();
+  context.moveTo(a.x, a.y);
+  context.lineTo(a.x + (b.x - a.x) * p, a.y + (b.y - a.y) * p);
+  context.stroke();
+  context.restore();
+}
+
+function drawFlowDot(context, a, b, progress) {
+  if (!a || !b || progress < 0 || progress > 1) return;
+  const px = a.x + (b.x - a.x) * progress;
+  const py = a.y + (b.y - a.y) * progress;
+  context.save();
+  context.fillStyle = '#70a7ff';
+  context.shadowColor = '#70a7ff';
+  context.shadowBlur = 16;
+  context.beginPath();
+  context.arc(px, py, 6, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+}
+
+function drawNodePulse(context, point, color, time, alpha = 0.8) {
+  if (!point) return;
+  const pulse = 10 + Math.sin(time / 160) * 2;
+  context.save();
+  context.globalAlpha = alpha;
+  context.strokeStyle = color;
+  context.lineWidth = 2;
+  context.shadowColor = color;
+  context.shadowBlur = 14;
+  context.beginPath();
+  context.arc(point.x, point.y, pulse, 0, Math.PI * 2);
+  context.stroke();
+  context.restore();
+}
+
+function situationPositionText(situation) {
+  const latitude = Number(situation.payload?.latitude);
+  const longitude = Number(situation.payload?.longitude);
+  if (Number.isFinite(latitude) && Number.isFinite(longitude)) {
+    return `经度${longitude.toFixed(4)}，纬度${latitude.toFixed(4)}`;
+  }
+  return '经度X，纬度Y';
+}
+
+function sensingFlowPopupText(item, index, points, situation) {
+  const positionText = situationPositionText(situation);
+  const next = points[index + 1];
+  if (index === 0 && item.node.type === 'Terminal') {
+    return '采集到态势数据：海上目标图片';
+  }
+  if (item.node.type === 'Cloud' || index === points.length - 1) {
+    return `${positionText}，出现巡逻舰，在侦查台湾以东区域海况。`;
+  }
+  if (item.node.type === 'Edge') {
+    return `收到态势情报，${positionText}附近检测到巡逻舰，携带光电载荷，运动朝向Z，分析其在巡逻海况...`;
+  }
+  return `中继收到态势数据，准备转发至${next?.node.label || '下一跳节点'}。`;
+}
+
+function flowPopupPlacement(item, index, points) {
+  const isLast = index === points.length - 1;
+  const width = item.node.type === 'Edge' ? 420 : item.node.type === 'Cloud' || isLast ? 330 : 300;
+  return {
+    x: item.point.x + (item.node.type === 'Terminal' ? 28 : 22),
+    y: item.point.y - (item.node.type === 'Edge' ? 120 : 90),
+    width,
+    maxLines: item.node.type === 'Edge' ? 4 : 3
+  };
+}
+
+function flowSegmentColor(from, to) {
+  const types = [from.node.type, to.node.type];
+  if (types.includes('Cloud') && types.includes('Edge')) return '#e0555a';
+  if (types.every((type) => type === 'Edge')) return '#f6c453';
+  return '#70a7ff';
+}
+
+function drawSensingFlowSequence(context, rect, points, situation, time = 0) {
+  if (points.length < 2) return;
+  const playback = sensingFlowAnimation(situation.id, time);
+  const elapsed = playback.elapsed;
+  const timeline = sensingFlowTimeline(points);
+  const activeFlow = timeline.events.find((event) => event.type === 'flow' && elapsed >= event.start && elapsed <= event.end);
+  const activePopup = timeline.events.find((event) => event.type === 'popup' && elapsed >= event.start && elapsed <= event.end);
+
+  for (const event of timeline.events.filter((item) => item.type === 'flow')) {
+    if (elapsed < event.start) continue;
+    const from = points[event.from];
+    const to = points[event.to];
+    const progress = elapsed >= event.end ? 1 : clamp((elapsed - event.start) / (event.end - event.start), 0, 1);
+    drawPartialSegment(context, from.point, to.point, progress, flowSegmentColor(from, to), to.node.type === 'Cloud' ? 3.2 : 2.8);
+  }
+
+  if (activeFlow) {
+    const from = points[activeFlow.from];
+    const to = points[activeFlow.to];
+    const progress = clamp((elapsed - activeFlow.start) / (activeFlow.end - activeFlow.start), 0, 1);
+    drawFlowDot(context, from.point, to.point, progress);
+  }
+
+  const pulseItem = activePopup ? points[activePopup.index] : activeFlow ? points[activeFlow.from] : points.at(-1);
+  drawNodePulse(context, pulseItem.point, '#70a7ff', time);
+
+  for (const event of timeline.events.filter((item) => item.type === 'popup')) {
+    const item = points[event.index];
+    const placement = flowPopupPlacement(item, event.index, points);
+    drawSensingFlowPopup(context, rect, {
+      text: sensingFlowPopupText(item, event.index, points, situation),
+      ...placement,
+      alpha: popupWindowAlpha(elapsed, event.start, event.end)
+    });
+  }
+}
+
+function renderSensingHoverCard() {
+  if (!el.sensingHoverCard || !el.sensingCanvas) return;
+  const hit = hoveredSensingNode();
+  const situation = latestSituationRecord();
+  if (!hit || !situation) {
+    el.sensingHoverCard.className = 'sensing-hover-card hidden';
+    el.sensingCanvas.style.cursor = '';
+    return;
+  }
+
+  const { node } = hit;
+  const description = situationDescriptionText(situation);
+  const imageName = situation.payload?.imageName || state.remoteImageName || '态势数据';
+  const packet = state.packetJourneys.find((item) => item.telemetryId === situation.id);
+  const path = situation.path || packet?.path || [];
+  const relayAtNode = state.relayLogs.find((log) => log.telemetryId === situation.id && log.nodeId === node.id);
+  const inbox = inboxForTelemetry(situation.id);
+  const relay = relayForTelemetry(situation.id);
+  const timing = situationFusionTiming(situation, packet, inbox, relay);
+  const imageMarkup = state._remoteImageUrl
+    ? `<img src="${escapeHtml(state._remoteImageUrl)}" alt="${escapeHtml(imageName)}" />`
+    : '<div class="image-empty">当前浏览器暂无已上传图片</div>';
+
+  let className = 'sensing-hover-card';
+  if (node.type === 'Terminal') {
+    className += ' image-card';
+    el.sensingHoverCard.innerHTML = `<header>
+      <b>${escapeHtml(node.id)} 终端态势数据采集</b><span>态势数据</span>
+    </header>
+    ${imageMarkup}
+    <div class="hover-kv">
+      <span><b>态势数据</b><em>${escapeHtml(imageName)}</em></span>
+      <span><b>来源</b><em>${escapeHtml(node.name || node.id)}</em></span>
+      <span><b>经度</b><em>${fmt(node.longitude, 6)}</em></span>
+      <span><b>纬度</b><em>${fmt(node.latitude, 6)}</em></span>
+      <span><b>采集时间</b><em>${escapeHtml(timeLabel(timing.startAt))}</em></span>
+      <span><b>协同感知时间</b><em>${escapeHtml(durationLabel(timing.elapsedMs))}</em></span>
+    </div>`;
+  } else if (node.type === 'Edge') {
+    className += ' edge-card';
+    el.sensingHoverCard.innerHTML = `<header>
+      <b>${escapeHtml(node.id)} 边缘中转态势数据</b><span>详细</span>
+    </header>
+    <p>${escapeHtml(description)}</p>
+    <div class="hover-kv">
+      <span><b>中转节点</b><em>${escapeHtml(node.name || node.id)}</em></span>
+      <span><b>状态</b><em>${escapeHtml(sensingPathStatus(node, situation))}</em></span>
+      <span><b>经度</b><em>${fmt(node.longitude, 6)}</em></span>
+      <span><b>纬度</b><em>${fmt(node.latitude, 6)}</em></span>
+      <span><b>态势数据</b><em>${escapeHtml(imageName)}</em></span>
+      <span><b>数据量</b><em>${fmt(situation.payload?.sampleSizeMb)} MB</em></span>
+      <span><b>协同感知时间</b><em>${escapeHtml(durationLabel(timing.elapsedMs))}</em></span>
+      <span><b>采集时间</b><em>${escapeHtml(timeLabel(timing.startAt))}</em></span>
+      <span><b>瓶颈带宽</b><em>${fmt(relayAtNode?.bottleneck)} Mbps</em></span>
+      <span><b>路径</b><em>${escapeHtml(path.join(' → ') || '--')}</em></span>
+    </div>`;
+  } else {
+    className += ' cloud-card';
+    el.sensingHoverCard.innerHTML = `<header>
+      <b>${escapeHtml(node.id)} 云端凝练态势</b><span>${inbox ? '已接收' : '回传中'}</span>
+    </header>
+    <p>${escapeHtml(compactSituationText(description))}</p>
+    <div class="hover-kv">
+      <span><b>来源</b><em>${escapeHtml(situation.source || '--')}</em></span>
+      <span><b>状态</b><em>${escapeHtml(sensingPathStatus(node, situation))}</em></span>
+      <span><b>经度</b><em>${fmt(node.longitude, 6)}</em></span>
+      <span><b>纬度</b><em>${fmt(node.latitude, 6)}</em></span>
+      <span><b>协同感知时间</b><em>${escapeHtml(durationLabel(timing.elapsedMs))}</em></span>
+      <span><b>云端形成态势</b><em>${escapeHtml(timeLabel(timing.cloudAt))}</em></span>
+      <span><b>态势数据</b><em>${escapeHtml(imageName)}</em></span>
+      <span><b>入云节点</b><em>${escapeHtml(inbox?.cloudNodeId || node.id)}</em></span>
+    </div>`;
+  }
+
+  el.sensingHoverCard.className = className;
+  el.sensingHoverCard.style.visibility = 'hidden';
+  const mapRect = el.sensingHoverCard.parentElement.getBoundingClientRect();
+  const canvasRect = el.sensingCanvas.getBoundingClientRect();
+  const cardWidth = el.sensingHoverCard.offsetWidth;
+  const cardHeight = el.sensingHoverCard.offsetHeight;
+  let left = canvasRect.left - mapRect.left + state.sensingMouse.x + 14;
+  let top = canvasRect.top - mapRect.top + state.sensingMouse.y + 14;
+  left = Math.max(14, Math.min(left, mapRect.width - cardWidth - 14));
+  top = Math.max(14, Math.min(top, mapRect.height - cardHeight - 14));
+  el.sensingHoverCard.style.left = `${left}px`;
+  el.sensingHoverCard.style.top = `${top}px`;
+  el.sensingHoverCard.style.visibility = '';
+  el.sensingCanvas.style.cursor = 'pointer';
+}
+
 function renderTSSensing(time = 0) {
   if (!el.sensingCanvas || !sensingCtx) return;
   const frame = latestTsFrame();
@@ -722,7 +1312,7 @@ function renderTSSensing(time = 0) {
     sensingCtx.fillRect(0, 0, rect.width, rect.height);
     sensingCtx.fillStyle = '#91a4a4';
     sensingCtx.font = '13px Segoe UI, sans-serif';
-    sensingCtx.fillText('可在左侧上传遥感图作为感知底图', 24, rect.height - 24);
+    sensingCtx.fillText('可在左侧上传态势数据作为感知底图', 24, rect.height - 24);
     sensingCtx.restore();
   }
   const situation = latestSituationRecord();
@@ -730,80 +1320,79 @@ function renderTSSensing(time = 0) {
     const inbox = inboxForTelemetry(situation.id);
     const relay = relayForTelemetry(situation.id);
     const packet = state.packetJourneys.find((item) => item.telemetryId === situation.id);
+    const timing = situationFusionTiming(situation, packet, inbox, relay);
     const path = situation.path || packet?.path || [];
     const nodeMap = new Map(state.nodes.map((node) => [node.id, node]));
-    const points = path.map((nodeId) => {
-      const node = nodeMap.get(nodeId);
-      return node ? { node, point: tsPoint(node, rect) } : null;
-    }).filter(Boolean);
+    const points = sensingRoutePoints(path, rect, nodeMap);
+    const routeMode = routeModeLabel(path);
+    state.sensingHitNodes = points.map((item) => ({ ...item, radius: sensingHitRadius(item.node) }));
 
     sensingCtx.save();
     if (points.length > 1) {
-      sensingCtx.strokeStyle = inbox ? 'rgba(65,214,166,0.78)' : 'rgba(112,167,255,0.7)';
-      sensingCtx.lineWidth = inbox ? 3 : 2;
-      sensingCtx.shadowColor = inbox ? '#41d6a6' : '#70a7ff';
-      sensingCtx.shadowBlur = 12;
-      sensingCtx.beginPath();
-      points.forEach(({ point }, index) => {
-        if (index === 0) sensingCtx.moveTo(point.x, point.y);
-        else sensingCtx.lineTo(point.x, point.y);
+      points.slice(0, -1).forEach(({ node, point }, index) => {
+        const next = points[index + 1];
+        const isCloudEdge = [node.type, next.node.type].includes('Cloud') && [node.type, next.node.type].includes('Edge');
+        sensingCtx.globalAlpha = 0.28;
+        sensingCtx.strokeStyle = isCloudEdge ? 'rgba(224,85,90,0.7)' : 'rgba(112,167,255,0.58)';
+        sensingCtx.lineWidth = isCloudEdge ? 2.4 : 2;
+        sensingCtx.shadowColor = 'transparent';
+        sensingCtx.shadowBlur = 0;
+        sensingCtx.beginPath();
+        sensingCtx.moveTo(point.x, point.y);
+        sensingCtx.lineTo(next.point.x, next.point.y);
+        sensingCtx.stroke();
       });
-      sensingCtx.stroke();
+      sensingCtx.globalAlpha = 1;
       sensingCtx.shadowBlur = 0;
-
-      const progress = packet?.progress ?? (inbox ? 1 : relay ? 0.58 : 0.18);
-      const segment = Math.max(0, Math.min(points.length - 2, Math.floor(progress * (points.length - 1))));
-      const local = Math.min(1, Math.max(0, progress * (points.length - 1) - segment));
-      const a = points[segment]?.point || points[0].point;
-      const b = points[segment + 1]?.point || points.at(-1).point;
-      const px = a.x + (b.x - a.x) * local;
-      const py = a.y + (b.y - a.y) * local;
-      sensingCtx.fillStyle = inbox ? '#41d6a6' : '#f6c453';
-      sensingCtx.shadowColor = sensingCtx.fillStyle;
-      sensingCtx.shadowBlur = 14;
-      sensingCtx.beginPath();
-      sensingCtx.arc(px, py, 6, 0, Math.PI * 2);
-      sensingCtx.fill();
-      sensingCtx.shadowBlur = 0;
+      drawPathModeLabel(sensingCtx, rect, routeMode);
     }
 
     points.forEach(({ node, point }) => {
+      const sz = node.type === 'Cloud' ? 13 : node.type === 'Edge' ? 9 : 6;
       sensingCtx.fillStyle = node.color || '#dce5e4';
-      sensingCtx.beginPath();
-      sensingCtx.arc(point.x, point.y, node.type === 'Cloud' ? 13 : node.type === 'Edge' ? 10 : 8, 0, Math.PI * 2);
+      if (node.type === 'Cloud') {
+        drawStar(sensingCtx, point.x, point.y, sz, sz * 0.38);
+      } else if (node.type === 'Edge') {
+        drawTriangle(sensingCtx, point.x, point.y, sz);
+      } else {
+        sensingCtx.beginPath();
+        sensingCtx.arc(point.x, point.y, sz, 0, Math.PI * 2);
+      }
       sensingCtx.fill();
       sensingCtx.fillStyle = '#eef7f6';
       sensingCtx.font = '700 12px Segoe UI, sans-serif';
       sensingCtx.fillText(node.id, point.x + 12, point.y - 10);
     });
+    drawSensingFlowSequence(sensingCtx, rect, points, situation, time);
     sensingCtx.restore();
 
-    if (el.sensingTitle) el.sensingTitle.textContent = `${situation.id} · ${situation.payload.imageName || state.remoteImageName || '遥感图'}`;
-    if (el.sensingBadge) el.sensingBadge.textContent = inbox ? '云端已接收' : relay ? '边缘中转中' : '上行回传中';
+    if (el.sensingTitle) el.sensingTitle.textContent = `${situation.id} · 态势数据`;
+    if (el.sensingBadge) el.sensingBadge.textContent = `云边端协同态势感知时间 ${durationLabel(timing.elapsedMs)} · ${routeMode}`;
     if (el.tsStats) {
       el.tsStats.innerHTML = [
-        ['图源', situation.payload.imageName || state.remoteImageName || '--', '终端拍摄'],
-        ['来源', situation.source, situation.sourceName || '终端节点'],
-        ['路径', path.join(' → ') || '--', '端-边-云'],
-        ['状态', inbox ? '已入云' : relay ? '边缘中转' : '传输中', inbox ? timeLabel(inbox.receivedAt) : '等待云端接收']
-      ].map(([label, value, hint]) => `<article class="data-stat-card">
+        ['云边端协同态势感知时间', durationLabel(timing.elapsedMs), timing.done ? '端侧采集→云端形成态势' : '端侧采集→当前'],
+        ['状态', timing.status, timing.done ? timeLabel(timing.cloudAt) : '融合计时中']
+      ].map(([label, value, hint]) => `<article class="data-stat-card${label === '云边端协同态势感知时间' ? ' fusion-time-card' : ''}">
         <b>${value}</b><span>${label}</span><em>${hint}</em>
       </article>`).join('');
     }
     if (el.tsDetectionList) {
       el.tsDetectionList.innerHTML = `<article class="ts-detection-card fused situation-card">
-        <header><b>云端态势描述</b><span>${inbox ? '已接收' : '回传中'}</span></header>
-        <p>${situationDescriptionText(situation)}</p>
+        <header><b>态势感知状态</b><span>${inbox ? '已接收' : '回传中'}</span></header>
         <div class="packet-kv">
-          <span><b>坐标</b><em>${fmt(situation.payload.latitude, 4)}, ${fmt(situation.payload.longitude, 4)}</em></span>
-          <span><b>图片</b><em>${situation.payload.imageName || '--'}</em></span>
-          <span><b>数据量</b><em>${fmt(situation.payload.sampleSizeMb)} MB</em></span>
-          <span><b>云端</b><em>${inbox?.cloudNodeId || situation.target || '--'}</em></span>
+          <span><b>采集时间</b><em>${timeLabel(timing.startAt)}</em></span>
+          <span><b>边缘中转</b><em>${timeLabel(timing.relayAt)}</em></span>
+          <span><b>云端形成态势</b><em>${timeLabel(timing.cloudAt)}</em></span>
+          <span><b>协同感知时间</b><em>${durationLabel(timing.elapsedMs)}</em></span>
+          <span><b>响应状态</b><em>${escapeHtml(timing.status)}</em></span>
         </div>
       </article>`;
     }
+    renderSensingHoverCard();
     return;
   }
+  state.sensingHitNodes = [];
+  renderSensingHoverCard();
   if (!frame) {
     if (el.sensingTitle) el.sensingTitle.textContent = '等待协同态势感知帧';
     if (el.sensingBadge) el.sensingBadge.textContent = '未感知';
@@ -812,7 +1401,7 @@ function renderTSSensing(time = 0) {
     return;
   }
 
-  if (el.sensingTitle) el.sensingTitle.textContent = `${frame.id} · ${frame.sourceImageName || state.remoteImageName || '遥感图'}`;
+  if (el.sensingTitle) el.sensingTitle.textContent = `${frame.id} · ${frame.sourceImageName || state.remoteImageName || '态势数据'}`;
   if (el.sensingBadge) el.sensingBadge.textContent = `${fmt(frame.fusedCount)} 融合 / ${fmt(frame.detections.length)} 目标`;
 
   const detections = frame.detections || [];
@@ -838,10 +1427,16 @@ function renderTSSensing(time = 0) {
 
   for (const node of state.nodes.filter((item) => item.type !== 'Cloud').slice(0, 120)) {
     const point = tsPoint(node, rect);
+    const sz = node.type === 'Edge' ? 5 : 3;
     sensingCtx.globalAlpha = node.type === 'Edge' ? 0.82 : 0.42;
     sensingCtx.fillStyle = node.color;
-    sensingCtx.beginPath();
-    sensingCtx.arc(point.x, point.y, node.type === 'Edge' ? 4.6 : 2.6, 0, Math.PI * 2);
+    if (node.type === 'Edge') {
+      drawTriangle(sensingCtx, point.x, point.y, sz);
+    } else {
+      sensingCtx.beginPath();
+      sensingCtx.arc(point.x, point.y, sz, 0, Math.PI * 2);
+    }
+    sensingCtx.fill();
     sensingCtx.fill();
   }
 
@@ -875,7 +1470,7 @@ function renderTSSensing(time = 0) {
       ['目标', fmt(detections.length), '态势目标'],
       ['融合', fmt(frame.fusedCount), '高置信'],
       ['弱感知', fmt(frame.weakCount), '需补采'],
-      ['图源', state.remoteImageName || frame.sourceImageName || '--', '当前底图']
+      ['态势数据', state.remoteImageName || frame.sourceImageName || '--', '当前底图']
     ].map(([label, value, hint]) => `<article class="data-stat-card">
       <b>${value}</b><span>${label}</span><em>${hint}</em>
     </article>`).join('');
@@ -893,8 +1488,34 @@ function renderTSSensing(time = 0) {
   }
 }
 
+function drawStar(ctx, cx, cy, outerR, innerR) {
+  const points = 5;
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i += 1) {
+    const r = i % 2 === 0 ? outerR : innerR;
+    const angle = (i * Math.PI) / points - Math.PI / 2;
+    const x = cx + Math.cos(angle) * r;
+    const y = cy + Math.sin(angle) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
+function drawTriangle(ctx, cx, cy, r) {
+  ctx.beginPath();
+  for (let i = 0; i < 3; i += 1) {
+    const angle = (i * 2 * Math.PI) / 3 - Math.PI / 2;
+    const x = cx + Math.cos(angle) * r;
+    const y = cy + Math.sin(angle) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+}
+
 function nodeHitRadius(node) {
-  return node.type === 'Cloud' ? 22 : node.type === 'Edge' ? 18 : 15;
+  return node.type === 'Cloud' ? 24 : node.type === 'Edge' ? 18 : 13;
 }
 
 function updateHover(rect) {
@@ -982,25 +1603,60 @@ function drawRemoteImageBackground(context, rect, alpha = 0.78) {
   return true;
 }
 
-function toScreen(node, rect) {
+function median(values) {
+  if (!values.length) return 0.5;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function topologyVisualView(nodes) {
+  const candidates = nodes.filter((node) => node.type !== 'Cloud');
+  const visualNodes = candidates.length >= 3 ? candidates : nodes;
+  const xs = visualNodes.map((node) => node.x).filter(Number.isFinite);
+  const ys = visualNodes.map((node) => node.y).filter(Number.isFinite);
+  if (!xs.length || !ys.length) return { cx: 0.5, cy: 0.5, zoom: 1 };
+
+  const spanX = Math.max(0.08, Math.max(...xs) - Math.min(...xs));
+  const spanY = Math.max(0.08, Math.max(...ys) - Math.min(...ys));
+  const zoom = clamp(Math.min(0.82 / spanX, 0.74 / spanY), 1, 1.72);
+  return {
+    cx: median(xs),
+    cy: median(ys),
+    zoom
+  };
+}
+
+function applyTopologyVisualZoom(x, y, view) {
+  const userViewport = state.topologyViewport || { zoom: 1, cx: 0.5, cy: 0.5 };
+  const autoX = view.cx + (x - view.cx) * view.zoom;
+  const autoY = view.cy + (y - view.cy) * view.zoom;
+  return {
+    x: clamp(userViewport.cx + (autoX - userViewport.cx) * userViewport.zoom, -1.8, 2.8),
+    y: clamp(userViewport.cy + (autoY - userViewport.cy) * userViewport.zoom, -1.8, 2.8)
+  };
+}
+
+function toScreen(node, rect, visualView) {
   const pad = 28;
   // Interpolate between previous and current position for smooth motion
   const elapsed = performance.now() - (state._lastStateAt || 0);
   const t = Math.min(1, elapsed / 900); // 900ms blend matching server tick
   const sx = node._prevX !== undefined ? node._prevX + (node.x - node._prevX) * t : node.x;
   const sy = node._prevY !== undefined ? node._prevY + (node.y - node._prevY) * t : node.y;
+  const visual = applyTopologyVisualZoom(sx, sy, visualView);
   return {
-    x: pad + sx * (rect.width - pad * 2),
-    y: pad + sy * (rect.height - pad * 2)
+    x: pad + visual.x * (rect.width - pad * 2),
+    y: pad + visual.y * (rect.height - pad * 2)
   };
 }
 
 function drawTopology(time = 0) {
   const rect = resizeCanvas(el.networkCanvas, ctx);
   drawBackground(ctx, rect);
-  drawRemoteImageBackground(ctx, rect, 0.62);
+  const visualView = topologyVisualView(state.nodes);
   state.nodeScreen.clear();
-  for (const node of state.nodes) state.nodeScreen.set(node.id, toScreen(node, rect));
+  for (const node of state.nodes) state.nodeScreen.set(node.id, toScreen(node, rect, visualView));
 
   ctx.save();
   const hoveredNode = state.popupNodeId;
@@ -1009,16 +1665,19 @@ function drawTopology(time = 0) {
     const b = state.nodeScreen.get(link.b);
     if (!a || !b) continue;
     const connected = hoveredNode && (link.a === hoveredNode || link.b === hoveredNode);
-    const linkAlpha = hoveredNode ? (connected ? 0.55 : 0.08) : 0.25;
+    const linkAlpha = hoveredNode ? (connected ? 0.42 : 0.08) : 0.25;
+    const baseLinkColor = link.selfOrganized ? '#41d6a6' : '#5e7a8a';
     ctx.globalAlpha = linkAlpha;
-    ctx.strokeStyle = connected ? '#ffffff' : '#5e7a8a';
-    ctx.lineWidth = connected ? 1.6 : 0.9;
+    ctx.strokeStyle = baseLinkColor;
+    ctx.lineWidth = link.selfOrganized ? 1.15 : 0.9;
     ctx.shadowColor = 'transparent';
     ctx.shadowBlur = 0;
+    if (link.selfOrganized) ctx.setLineDash(link.role === 'terminal-peer' ? [5, 7] : [10, 8]);
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
     ctx.stroke();
+    if (link.selfOrganized) ctx.setLineDash([]);
 
     // Flow particles colored by sending node type
     if (link.active && (!hoveredNode || connected)) {
@@ -1156,22 +1815,33 @@ function drawTopology(time = 0) {
   for (const node of state.nodes) {
     const point = state.nodeScreen.get(node.id);
     if (!point) continue;
-    const base = node.type === 'Cloud' ? 7.6 : node.type === 'Edge' ? 5.5 : 3.8;
-    const ring = base + (node.txMbps + node.rxMbps > 0 ? Math.sin(time / 180 + node.pulse * 6.28) * 2 + 5 : 0);
-    ctx.fillStyle = node.status === 'online' ? node.color : '#58656c';
-    ctx.strokeStyle = node.status === 'online' ? 'rgba(255,255,255,0.7)' : 'rgba(180,190,190,0.32)';
+    const size = node.type === 'Cloud' ? 12 : node.type === 'Edge' ? 8 : 4.5;
+    const ring = size + (node.txMbps + node.rxMbps > 0 ? Math.sin(time / 180 + node.pulse * 6.28) * 2 + 5 : 0);
+    const color = node.status === 'online' ? node.color : '#58656c';
+    const strokeColor = node.status === 'online' ? 'rgba(255,255,255,0.7)' : 'rgba(180,190,190,0.32)';
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.strokeStyle = strokeColor;
     ctx.lineWidth = state.selectedNodeId === node.id ? 2.4 : 1;
-    if (ring > base) {
-      ctx.fillStyle = `${node.color}33`;
+    // Glow ring when transmitting
+    if (ring > size) {
+      ctx.fillStyle = `${color}33`;
       ctx.beginPath();
       ctx.arc(point.x, point.y, ring, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = node.color;
+      ctx.fillStyle = color;
     }
-    ctx.beginPath();
-    ctx.arc(point.x, point.y, base, 0, Math.PI * 2);
+    if (node.type === 'Cloud') {
+      drawStar(ctx, point.x, point.y, size, size * 0.38);
+    } else if (node.type === 'Edge') {
+      drawTriangle(ctx, point.x, point.y, size);
+    } else {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, size, 0, Math.PI * 2);
+    }
     ctx.fill();
     ctx.stroke();
+    ctx.restore();
   }
   updateHover(rect);
 }
@@ -1223,9 +1893,16 @@ function renderTrace() {
     path.forEach((nodeId, hop) => {
       const x = steps === 1 ? left : left + (right - left) * hop / (steps - 1);
       const node = nodeById(nodeId);
+      const size = node?.type === 'Cloud' ? 9 : node?.type === 'Edge' ? 7 : 5;
       traceCtx.fillStyle = node?.color || '#cfd9d8';
-      traceCtx.beginPath();
-      traceCtx.arc(x, y, stream.type === 'packet' ? 7 : 6, 0, Math.PI * 2);
+      if (node?.type === 'Cloud') {
+        drawStar(traceCtx, x, y, size, size * 0.38);
+      } else if (node?.type === 'Edge') {
+        drawTriangle(traceCtx, x, y, size);
+      } else {
+        traceCtx.beginPath();
+        traceCtx.arc(x, y, size, 0, Math.PI * 2);
+      }
       traceCtx.fill();
       traceCtx.fillStyle = '#cbd6d5';
       traceCtx.fillText(nodeId, x - 18, y - 14);
@@ -1297,7 +1974,11 @@ function applyState(payload) {
   el.togglePause.textContent = state.paused ? '▶ 恢复' : '⏸ 暂停';
   el.togglePause.style.background = state.paused ? '#41d6a6' : '#f6c453';
   if (payload.summary) {
+    if (!document.activeElement || document.activeElement !== el.nodeCountInput) {
+      el.nodeCountInput.value = payload.summary.nodeCount || el.nodeCountInput.value;
+    }
     el.edgeCountInput.max = payload.summary.maxEdgeLimit || Math.floor((payload.summary.nodeCount || 200) / 3);
+    el.edgeCountInput.min = 1;
     if (!state.editingEdgeCount && !state.edgeCountTouched) {
       el.edgeCountInput.value = payload.summary.edgeLimit || recommendedEdgeCount(payload.summary.nodeCount || 200);
     }
@@ -1421,7 +2102,7 @@ function bindEvents() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           sourceId,
-          imageName: state.remoteImageName || '遥感图',
+          imageName: state.remoteImageName || '态势数据',
           description
         })
       });
@@ -1429,6 +2110,7 @@ function bindEvents() {
         const result = await res.json();
         const stateRes = await fetch('/api/state');
         if (stateRes.ok) applyState(await stateRes.json());
+        state.sensingFlowAnimation = { recordId: null, startedAt: 0 };
         document.querySelectorAll('.tabs button').forEach((btn) => btn.classList.toggle('active', btn.dataset.view === 'sensing'));
         document.querySelectorAll('.view').forEach((view) => view.classList.remove('active'));
         byId('sensingView')?.classList.add('active');
@@ -1497,7 +2179,12 @@ function bindEvents() {
         node_id: node.id,
         name: node.name,
         type: node.type,
+        unit_name: node.unitName || node.name || '',
+        branch: node.branch || '',
         zone: node.zone,
+        longitude: node.longitude ?? '',
+        latitude: node.latitude ?? '',
+        source_columns: node.sourceColumns || '',
         x: Number(node.x?.toFixed?.(4) ?? node.x),
         y: Number(node.y?.toFixed?.(4) ?? node.y),
         compute_total: Math.round(node.computeTotal || 0),
@@ -1509,7 +2196,11 @@ function bindEvents() {
         load: Number((node.load || 0).toFixed(3)),
         status: node.status,
         gateway_edge_id: node.gatewayEdgeId || '',
-        backup_edge_id: node.backupEdgeId || ''
+        backup_edge_id: node.backupEdgeId || '',
+        uplink_route_mode: node.multiHopRelay?.mode || 'default',
+        uplink_hop_count: node.multiHopRelay?.hopCount || (node.type === 'Cloud' ? 0 : node.type === 'Edge' ? 1 : 2),
+        relay_terminal_id: node.multiHopRelay?.relayTerminalId || '',
+        relay_edge_id: node.multiHopRelay?.relayEdgeId || ''
       }));
     }
     if (kind === 'links') {
@@ -1524,7 +2215,8 @@ function bindEvents() {
         utilization: Number((link.utilization || 0).toFixed(3)),
         distance_m: Number((link.distance || 0).toFixed(1)),
         active: Boolean(link.active),
-        persistent: Boolean(link.persistent)
+        persistent: Boolean(link.persistent),
+        topology_layer: link.topologyLayer || ''
       }));
     }
     if (kind === 'tasks') {
@@ -1578,8 +2270,8 @@ function bindEvents() {
     }
     const edgeCount = Number(el.edgeCountInput.value);
     const maxEdge = Math.floor(nodeCount / 3);
-    if (!Number.isFinite(edgeCount) || edgeCount < 3 || edgeCount > maxEdge) {
-      alert(`边缘节点数量需在 3-${maxEdge} 之间`);
+    if (!Number.isFinite(edgeCount) || edgeCount < 1 || edgeCount > maxEdge) {
+      alert(`边缘节点数量需在 1-${maxEdge} 之间`);
       return;
     }
     const linkRadius = Number(el.linkRadiusInput.value);
@@ -1631,6 +2323,7 @@ function bindEvents() {
     const nodeCount = Number(el.nodeCountInput.value) || 200;
     const maxEdge = Math.floor(nodeCount / 3);
     el.edgeCountInput.max = maxEdge;
+    el.edgeCountInput.min = 1;
     state.edgeCountTouched = false;
     el.edgeCountInput.value = recommendedEdgeCount(nodeCount);
   });
@@ -1647,7 +2340,7 @@ function bindEvents() {
     const maxEdge = Math.floor(nodeCount / 3);
     const value = Number(el.edgeCountInput.value);
     if (Number.isFinite(value)) {
-      el.edgeCountInput.value = Math.min(maxEdge, Math.max(3, Math.round(value)));
+      el.edgeCountInput.value = Math.min(maxEdge, Math.max(1, Math.round(value)));
     }
   });
   [el.computeInput, el.storageInput, el.dataInput].forEach((input) => {
@@ -1659,6 +2352,31 @@ function bindEvents() {
   el.remoteImageInput?.addEventListener('change', (event) => loadRemoteImage(event.target.files?.[0]));
   el.situationSourceSelect?.addEventListener('change', () => fillDefaultSituationDescription(true));
   el.triggerTsScan?.addEventListener('click', triggerTSSensing);
+  el.sensingCanvas?.addEventListener('mousemove', (event) => {
+    const rect = el.sensingCanvas.getBoundingClientRect();
+    state.sensingMouse = { x: event.clientX - rect.left, y: event.clientY - rect.top, inside: true };
+    renderSensingHoverCard();
+  });
+  el.sensingCanvas?.addEventListener('mouseleave', () => {
+    state.sensingMouse.inside = false;
+    if (el.sensingHoverCard) el.sensingHoverCard.className = 'sensing-hover-card hidden';
+    if (el.sensingCanvas) el.sensingCanvas.style.cursor = '';
+  });
+  document.querySelectorAll('.collapsible-panel').forEach((panel) => {
+    const trigger = panel.querySelector('.collapsible-trigger');
+    const label = trigger?.querySelector('em');
+    if (!trigger) return;
+    const sync = () => {
+      const collapsed = panel.classList.contains('collapsed');
+      trigger.setAttribute('aria-expanded', String(!collapsed));
+      if (label) label.textContent = collapsed ? '展开' : '收起';
+    };
+    sync();
+    trigger.addEventListener('click', () => {
+      panel.classList.toggle('collapsed');
+      sync();
+    });
+  });
   document.querySelectorAll('[data-export]').forEach((button) => {
     button.addEventListener('click', () => exportDataset(button.dataset.export));
   });
@@ -1666,6 +2384,29 @@ function bindEvents() {
     const rect = el.networkCanvas.getBoundingClientRect();
     state.mouse = { x: event.clientX - rect.left, y: event.clientY - rect.top, inside: true };
   });
+  el.networkCanvas.addEventListener('wheel', (event) => {
+    event.preventDefault();
+    const rect = el.networkCanvas.getBoundingClientRect();
+    const pad = 28;
+    const innerW = Math.max(1, rect.width - pad * 2);
+    const innerH = Math.max(1, rect.height - pad * 2);
+    const mx = clamp((event.clientX - rect.left - pad) / innerW, 0, 1);
+    const my = clamp((event.clientY - rect.top - pad) / innerH, 0, 1);
+    const current = state.topologyViewport || { zoom: 1, cx: 0.5, cy: 0.5 };
+    const nextZoom = clamp(current.zoom * (event.deltaY < 0 ? 1.18 : 1 / 1.18), 1, 6);
+    if (Math.abs(nextZoom - current.zoom) < 0.001) return;
+    const ratio = current.zoom / nextZoom;
+    state.topologyViewport = {
+      zoom: nextZoom,
+      cx: clamp(mx - (mx - current.cx) * ratio, 0, 1),
+      cy: clamp(my - (my - current.cy) * ratio, 0, 1)
+    };
+    state.mouse = { x: event.clientX - rect.left, y: event.clientY - rect.top, inside: true };
+    el.nodePopup.classList.add('hidden');
+    state.popupNodeId = null;
+    state._hoveredNodeId = null;
+    state.popupRenderKey = null;
+  }, { passive: false });
   el.networkCanvas.addEventListener('mouseleave', () => {
     state.mouse.inside = false;
     el.hoverTip.classList.add('hidden');
@@ -1740,7 +2481,7 @@ function animate(time) {
       renderDataCollection();
     }
     const sensingView = byId('sensingView');
-    if (sensingView?.classList.contains('active')) renderTSSensing(renderTime);
+    if (sensingView?.classList.contains('active')) renderTSSensing(time);
     state.lastFrame = time;
   }
   requestAnimationFrame(animate);

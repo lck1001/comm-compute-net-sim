@@ -18,7 +18,7 @@
           <div class="panel-title">仿真设置</div>
           <div class="form-row inline-fields">
             <span class="compact"><label for="nodeCountInput">节点</label><input id="nodeCountInput" type="number" min="3" max="2000" step="10" value="200"></span>
-            <span class="compact"><label for="edgeCountInput">边缘</label><input id="edgeCountInput" type="number" min="3" max="66" step="1" value="66"></span>
+            <span class="compact"><label for="edgeCountInput">边缘</label><input id="edgeCountInput" type="number" min="1" max="66" step="1" value="66"></span>
           </div>
           <div class="form-row compact">
             <label for="linkRadiusInput">半径</label>
@@ -30,8 +30,11 @@
           </div>
         </section>
 
-        <section class="panel controls-panel data-ingest-panel">
-          <div class="panel-title">数据接入</div>
+        <section class="panel controls-panel data-ingest-panel collapsible-panel" data-collapsible="data-ingest">
+          <button class="panel-title collapsible-trigger" type="button" aria-expanded="true" aria-controls="dataIngestBody">
+            <span>数据接入</span><em>收起</em>
+          </button>
+          <div id="dataIngestBody" class="collapsible-body">
           <div class="import-row">
             <label for="remoteImageInput">遥感图</label>
             <input id="remoteImageInput" type="file" accept="image/*" />
@@ -52,10 +55,14 @@
             <button type="button" data-export="tasks">导出任务</button>
             <button type="button" data-export="telemetry">导出采集</button>
           </div>
+          </div>
         </section>
 
-        <section class="panel controls-panel task-panel-fill task-inject-panel">
-          <div class="panel-title">任务注入</div>
+        <section class="panel controls-panel task-panel-fill task-inject-panel collapsible-panel collapsed" data-collapsible="task-inject">
+          <button class="panel-title collapsible-trigger" type="button" aria-expanded="false" aria-controls="taskInjectBody">
+            <span>任务注入</span><em>展开</em>
+          </button>
+          <div id="taskInjectBody" class="collapsible-body">
           <div class="form-row">
             <label class="sr-only" for="originSelect">发起节点</label>
             <select id="originSelect"></select>
@@ -106,6 +113,7 @@
           <div class="task-spacer"></div>
           <button id="injectTask" class="primary-button">注入任务</button>
           <div id="injectStatus" class="inject-status hidden"></div>
+          </div>
         </section>
       </aside>
 
@@ -119,9 +127,9 @@
             <button data-view="sensing">态势感知</button>
           </div>
           <div class="topbar-legend">
-            <span class="legend-dot" style="background:#f6c453"></span>云
-            <span class="legend-dot" style="background:#41d6a6"></span>边
-            <span class="legend-dot" style="background:#70a7ff"></span>端
+            <span class="legend-icon legend-star"></span>云
+            <span class="legend-icon legend-tri"></span>边
+            <span class="legend-icon legend-dot-round"></span>端
           </div>
           <div class="topbar-stats">
             <span id="onlineNodes">-- 在线</span>
@@ -137,6 +145,7 @@
         </section>
 
         <section id="linksView" class="view table-view">
+          <div id="linkStats" class="link-stats"></div>
           <div class="table-wrap">
             <table>
               <thead>
@@ -144,6 +153,7 @@
                   <th>链路</th>
                   <th>端点</th>
                   <th>角色</th>
+                  <th>距云跳数</th>
                   <th>带宽 Mbps</th>
                   <th>时延 ms</th>
                   <th>丢包 %</th>
@@ -202,11 +212,12 @@
               <div class="sensing-title">
                 <div>
                   <span class="eyebrow">遥感图协同态势感知</span>
-                  <h2 id="sensingTitle">等待遥感图或仿真感知帧</h2>
+                  <h2 id="sensingTitle">等待态势数据或仿真感知帧</h2>
                 </div>
                 <span id="sensingBadge" class="collector-badge">融合态势</span>
               </div>
               <canvas id="sensingCanvas" aria-label="remote sensing target sensing"></canvas>
+              <div id="sensingHoverCard" class="sensing-hover-card hidden"></div>
             </section>
             <aside class="sensing-side">
               <div id="tsStats" class="ts-stats"></div>
@@ -222,6 +233,7 @@
           <div class="metric-grid">
             <div><span id="nodeCount">--</span><label>节点</label></div>
             <div><span id="activeLinks">--</span><label>链路</label></div>
+            <div><span id="selfOrganizedLinks">--</span><label>自组链路</label></div>
             <div><span id="avgUtil">--</span><label>平均负载</label></div>
             <div><span id="runningTasks">--</span><label>运行任务</label></div>
           </div>

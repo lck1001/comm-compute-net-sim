@@ -1,23 +1,33 @@
 ﻿import http from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { TextDecoder } from 'node:util';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, 'public');
+const dataDir = path.join(__dirname, 'data');
+const simulationDatabasePath = path.join(dataDir, 'simulation-results.json');
+const topologyCsvPath = process.env.TOPOLOGY_CSV
+  ? path.resolve(process.env.TOPOLOGY_CSV)
+  : path.join(__dirname, 'docs', '轨迹.csv');
+const csvTopologyRecords = loadTopologyCsv(topologyCsvPath);
 const PORT = Number(process.env.PORT || 4173);
-let NODE_COUNT = Number(process.env.NODE_COUNT || 200);
+const DEFAULT_EDGE_COUNT = 9;
+const TERMINALS_PER_EDGE = 20;
+const DEFAULT_NODE_COUNT = 1 + DEFAULT_EDGE_COUNT + DEFAULT_EDGE_COUNT * TERMINALS_PER_EDGE;
+const DEFAULT_TOTAL_NETWORK_BANDWIDTH = 12000;
+let NODE_COUNT = Number(process.env.NODE_COUNT || DEFAULT_NODE_COUNT);
 const TICK_MS = 900;
-const TASK_INTERVAL_MS = 6800;
-const MAX_TASKS = 36;
-const MAX_PACKET_JOURNEYS = 96;
-const MAX_TELEMETRY_RECORDS = 120;
-const MAX_RELAY_LOGS = 160;
-const MAX_CLOUD_INBOX = 120;
+const MAX_TASKS = 96;
+const MAX_PACKET_JOURNEYS = 240;
+const MAX_TELEMETRY_RECORDS = 240;
+const MAX_RELAY_LOGS = 320;
+const MAX_CLOUD_INBOX = 240;
 const MAX_EXTERNAL_PLATFORM_TRACKS = 240;
 const MAX_TS_FRAMES = 80;
-const TS_TARGET_COUNT = Number(process.env.TS_TARGET_COUNT || 9);
+const TS_TARGET_COUNT = Number(process.env.TS_TARGET_COUNT || 70);
 const MARITIME_BOUNDS = {
   minLat: 18.2,
   maxLat: 22.8,
@@ -26,18 +36,18 @@ const MARITIME_BOUNDS = {
 };
 
 function defaultEdgeCount(total) {
-  return Math.min(Math.floor(total * MAX_EDGE_RATIO), total - 1, Math.max(10, Math.floor(total / 3)));
+  return Math.min(Math.max(1, total - 1), DEFAULT_EDGE_COUNT);
 }
-const MAX_EDGE_RATIO = 1 / 3;
 let EDGE_COUNT = process.env.EDGE_COUNT
-  ? Math.min(Math.floor(NODE_COUNT * MAX_EDGE_RATIO), Math.max(3, Number(process.env.EDGE_COUNT)))
+  ? Math.min(NODE_COUNT - 1, Math.max(1, Number(process.env.EDGE_COUNT)))
   : defaultEdgeCount(NODE_COUNT);
 let LINK_RADIUS = Number(process.env.LINK_RADIUS || 0.55);
+let TOTAL_NETWORK_BANDWIDTH = Number(process.env.NETWORK_BANDWIDTH || DEFAULT_TOTAL_NETWORK_BANDWIDTH);
 
 const nodeTypes = [
-  { type: 'Cloud', label: '云节点', compute: [1800, 2400], storage: [2200, 3200], color: '#f6c453' },
-  { type: 'Edge', label: '边缘节点', compute: [520, 980], storage: [640, 1280], color: '#41d6a6' },
-  { type: 'Terminal', label: '终端节点', compute: [100, 360], storage: [120, 520], color: '#70a7ff' }
+  { type: 'Cloud', label: '云节点', compute: [1800, 2400], storage: [2200, 3200], bandwidth: [6200, 9000], color: '#f6c453' },
+  { type: 'Edge', label: '边缘节点', compute: [520, 980], storage: [640, 1280], bandwidth: [1100, 1800], color: '#e0555a' },
+  { type: 'Terminal', label: '终端节点', compute: [100, 360], storage: [120, 520], bandwidth: [160, 420], color: '#70a7ff' }
 ];
 
 const mime = new Map([
@@ -49,6 +59,129 @@ const mime = new Map([
   ['.png', 'image/png'],
   ['.jpg', 'image/jpeg']
 ]);
+
+function decodeCsv(buffer) {
+  if (buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) {
+    return new TextDecoder('utf-8').decode(buffer);
+  }
+  try {
+    return new TextDecoder('gb18030').decode(buffer);
+  } catch {
+    return buffer.toString('utf8');
+  }
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let quoted = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const next = text[i + 1];
+    if (quoted) {
+      if (char === '"' && next === '"') {
+        cell += '"';
+        i += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        cell += char;
+      }
+    } else if (char === '"') {
+      quoted = true;
+    } else if (char === ',') {
+      row.push(cell);
+      cell = '';
+    } else if (char === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else if (char !== '\r') {
+      cell += char;
+    }
+  }
+  if (cell || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows.filter((item) => item.some((value) => String(value).trim()));
+}
+
+function topologyNodeType(unitName, branch) {
+  const text = `${unitName || ''}${branch || ''}`;
+  if (text.includes('岸基中心')) return 'Cloud';
+  if (/航母|编队/.test(text)) return 'Edge';
+  return 'Terminal';
+}
+
+function loadTopologyCsv(filePath) {
+  if (!existsSync(filePath)) return [];
+  const rows = parseCsv(decodeCsv(readFileSync(filePath)));
+  const records = [];
+  rows.slice(1).forEach((row, index) => {
+    const unitName = String(row[0] || '').trim();
+    const branch = String(row[2] || '').trim();
+    const longitude = Number(row[4]);
+    const latitude = Number(row[5]);
+    if (!unitName || !Number.isFinite(longitude) || !Number.isFinite(latitude)) return;
+    records.push({
+      rowIndex: index + 2,
+      unitName,
+      branch,
+      longitude,
+      latitude,
+      nodeType: topologyNodeType(unitName, branch)
+    });
+  });
+  return records;
+}
+
+function topologyBounds(records) {
+  const points = records.filter((record) => Number.isFinite(record.latitude) && Number.isFinite(record.longitude));
+  if (!points.length) return { ...MARITIME_BOUNDS };
+  const latitudes = points.map((record) => record.latitude);
+  const longitudes = points.map((record) => record.longitude);
+  let minLat = Math.min(...latitudes);
+  let maxLat = Math.max(...latitudes);
+  let minLng = Math.min(...longitudes);
+  let maxLng = Math.max(...longitudes);
+  const latSpan = Math.max(0.4, maxLat - minLat);
+  const lngSpan = Math.max(0.4, maxLng - minLng);
+  minLat -= latSpan * 0.16;
+  maxLat += latSpan * 0.22;
+  minLng -= lngSpan * 0.18;
+  maxLng += lngSpan * 0.12;
+  return { minLat, maxLat, minLng, maxLng };
+}
+
+function applyTopologyBounds(records) {
+  const bounds = topologyBounds(records);
+  MARITIME_BOUNDS.minLat = bounds.minLat;
+  MARITIME_BOUNDS.maxLat = bounds.maxLat;
+  MARITIME_BOUNDS.minLng = bounds.minLng;
+  MARITIME_BOUNDS.maxLng = bounds.maxLng;
+}
+
+function sourceRecordSort(left, right) {
+  const typeOrder = { Cloud: 0, Edge: 1, Terminal: 2 };
+  return (typeOrder[left.nodeType] ?? 9) - (typeOrder[right.nodeType] ?? 9)
+    || String(left.unitName).localeCompare(String(right.unitName), 'zh-CN');
+}
+
+function sampleTopologyRecords(pool, count) {
+  if (!pool.length || count <= 0) return [];
+  const shuffled = [...pool];
+  for (let i = shuffled.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  if (count <= shuffled.length) return shuffled.slice(0, count);
+  const selected = [...shuffled];
+  while (selected.length < count) selected.push(choose(pool));
+  return selected;
+}
 
 let seed = Number(process.env.SIM_SEED || 20260704);
 const clients = new Set();
@@ -66,9 +199,11 @@ let nextLinkId = 1;
 let nextPacketId = 1;
 let nextTelemetryId = 1;
 let nextTsFrameId = 1;
-let lastAutoTaskAt = 0;
 let tickCount = 0;
 let paused = false;
+let lastScenarioRun = null;
+let persistenceTimer = null;
+let persistenceReason = 'startup';
 
 function random() {
   seed = (seed * 1664525 + 1013904223) >>> 0;
@@ -95,7 +230,102 @@ function idNumber(id) {
   return Number(String(id || '').replace(/\D/g, '')) || 0;
 }
 
+function typeInfo(type) {
+  return nodeTypes.find((item) => item.type === type) || nodeTypes[2];
+}
+
+function bandwidthScale() {
+  return clamp(TOTAL_NETWORK_BANDWIDTH / DEFAULT_TOTAL_NETWORK_BANDWIDTH, 0.28, 4.5);
+}
+
+function createNodeFromSource(index, source, options = {}) {
+  const info = typeInfo(source.nodeType);
+  const computeTotal = Math.round(between(info.compute[0], info.compute[1]));
+  const storageTotal = Math.round(between(info.storage[0], info.storage[1]));
+  const bandwidthTotal = Math.round(between(info.bandwidth[0], info.bandwidth[1]) * bandwidthScale());
+  const point = geoToCanvas(source.latitude, source.longitude);
+  const duplicateOffset = options.duplicateOffset || { x: 0, y: 0 };
+  return {
+    id: `N${String(index).padStart(3, '0')}`,
+    name: source.nodeType === 'Cloud' ? '岸基中心' : source.unitName,
+    type: source.nodeType,
+    label: info.label,
+    unitName: source.unitName,
+    branch: source.branch,
+    sourceColumns: {
+      A: source.unitName,
+      C: source.branch,
+      E: source.longitude,
+      F: source.latitude
+    },
+    zone: options.zone || (source.nodeType === 'Cloud' ? '岸基' : source.nodeType === 'Edge' ? '近岸' : '远海'),
+    latitude: Number(source.latitude.toFixed(6)),
+    longitude: Number(source.longitude.toFixed(6)),
+    x: clamp(point.x + duplicateOffset.x, 0.04, 0.96),
+    y: clamp(point.y + duplicateOffset.y, 0.06, 0.94),
+    computeTotal,
+    storageTotal,
+    memoryTotal: storageTotal,
+    computeFree: computeTotal,
+    storageFree: storageTotal,
+    memoryFree: storageTotal,
+    bandwidthTotal,
+    bandwidthFree: bandwidthTotal,
+    bandwidthUsed: 0,
+    txMbps: 0,
+    rxMbps: 0,
+    load: between(0.08, 0.42),
+    status: 'online',
+    color: info.color,
+    hopsToCloud: source.nodeType === 'Cloud' ? 0 : source.nodeType === 'Edge' ? 1 : 2,
+    pulse: random(),
+    geoFixed: true
+  };
+}
+
+function createCsvNodes() {
+  const maxEdge = Math.max(1, NODE_COUNT - 1);
+  EDGE_COUNT = Math.min(maxEdge, Math.max(0, Math.round(EDGE_COUNT)));
+  const terminalCount = Math.max(0, NODE_COUNT - 1 - EDGE_COUNT);
+  const edgePool = csvTopologyRecords.filter((record) => record.nodeType === 'Edge');
+  const terminalPool = csvTopologyRecords.filter((record) => record.nodeType === 'Terminal');
+  const selectedEdges = sampleTopologyRecords(edgePool.length ? edgePool : csvTopologyRecords, EDGE_COUNT)
+    .map((record) => ({ ...record, nodeType: 'Edge' }));
+  const selectedTerminals = sampleTopologyRecords(terminalPool.length ? terminalPool : csvTopologyRecords, terminalCount)
+    .map((record) => ({ ...record, nodeType: 'Terminal' }));
+  const sampledRecords = [...selectedEdges, ...selectedTerminals];
+  const rawBounds = topologyBounds(sampledRecords.length ? sampledRecords : csvTopologyRecords);
+  const cloudSource = {
+    unitName: '岸基中心',
+    branch: '岸基中心',
+    nodeType: 'Cloud',
+    longitude: rawBounds.minLng,
+    latitude: rawBounds.maxLat
+  };
+  const sources = [cloudSource, ...sampledRecords];
+  applyTopologyBounds(sources);
+
+  const duplicateCounts = new Map();
+  sources.forEach((source, index) => {
+    const key = `${source.longitude.toFixed(4)},${source.latitude.toFixed(4)}`;
+    const count = duplicateCounts.get(key) || 0;
+    duplicateCounts.set(key, count + 1);
+    const angle = count * Math.PI * 0.72;
+    const radius = count ? 0.012 + count * 0.004 : 0;
+    nodes.push(createNodeFromSource(index + 1, source, {
+      duplicateOffset: {
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius
+      }
+    }));
+  });
+}
+
 function createNodes() {
+  if (csvTopologyRecords.length) {
+    createCsvNodes();
+    return;
+  }
   const zones = [
     { id: 'A', cx: 0.23, cy: 0.28 },
     { id: 'B', cx: 0.73, cy: 0.24 },
@@ -112,6 +342,8 @@ function createNodes() {
     const spread = Math.sqrt(random()) * radius;
     const computeTotal = Math.round(between(typeInfo.compute[0], typeInfo.compute[1]));
     const storageTotal = Math.round(between(typeInfo.storage[0], typeInfo.storage[1]));
+    const bandwidthTotal = Math.round(between(typeInfo.bandwidth[0], typeInfo.bandwidth[1]) * bandwidthScale());
+    const hopsToCloud = typeInfo.type === 'Cloud' ? 0 : typeInfo.type === 'Edge' ? 1 : 2;
 
     nodes.push({
       id: `N${String(i + 1).padStart(3, '0')}`,
@@ -123,13 +355,19 @@ function createNodes() {
       y: typeInfo.type === 'Cloud' ? 0.48 : clamp(zone.cy + Math.sin(angle) * spread + between(-0.018, 0.018), 0.06, 0.94),
       computeTotal,
       storageTotal,
+      memoryTotal: storageTotal,
       computeFree: computeTotal,
       storageFree: storageTotal,
+      memoryFree: storageTotal,
+      bandwidthTotal,
+      bandwidthFree: bandwidthTotal,
+      bandwidthUsed: 0,
       txMbps: 0,
       rxMbps: 0,
       load: between(0.08, 0.42),
       status: 'online',
       color: typeInfo.color,
+      hopsToCloud,
       pulse: random()
     });
   }
@@ -199,7 +437,7 @@ function linkProfile(role, d) {
   };
   const profile = profiles[role] || profiles.flex;
   return {
-    bandwidth: Math.round(between(profile.bandwidth[0], profile.bandwidth[1])),
+    bandwidth: Math.round(between(profile.bandwidth[0], profile.bandwidth[1]) * bandwidthScale()),
     latency: Math.round(between(profile.latency[0], profile.latency[1]) + d * profile.distanceFactor),
     loss: Number(between(profile.loss[0], profile.loss[1]).toFixed(2)),
     utilization: Number(between(profile.utilization[0], profile.utilization[1]).toFixed(2))
@@ -212,6 +450,9 @@ function createPhysicalLink(aId, bId, options = {}) {
   if (link) {
     if (options.persistent) link.persistent = true;
     if (options.role) link.role = options.role;
+    if (options.selfOrganized !== undefined) link.selfOrganized = Boolean(options.selfOrganized);
+    if (options.medium) link.medium = options.medium;
+    if (options.topologyLayer) link.topologyLayer = options.topologyLayer;
     if (options.active !== false && !link.active) link.changedAt = Date.now();
     if (options.active !== false) link.active = true;
     link.lastUsedAt = Date.now();
@@ -233,6 +474,10 @@ function createPhysicalLink(aId, bId, options = {}) {
     role,
     active: options.active !== false,
     persistent: Boolean(options.persistent),
+    selfOrganized: Boolean(options.selfOrganized),
+    medium: options.medium || (role === 'edge-cloud' ? 'wired' : 'wireless'),
+    topologyLayer: options.topologyLayer || role,
+    reservedMbps: 0,
     lastUsedAt: Date.now(),
     changedAt: Date.now()
   };
@@ -258,6 +503,165 @@ function nearestNodes(source, candidates, limit, options = {}) {
     .map((item) => item.node);
 }
 
+function topologyPairsByDistance(items) {
+  const pairs = [];
+  for (let i = 0; i < items.length; i += 1) {
+    for (let j = i + 1; j < items.length; j += 1) {
+      pairs.push({ a: items[i], b: items[j], d: distance(items[i], items[j]) });
+    }
+  }
+  return pairs.sort((left, right) => left.d - right.d);
+}
+
+function optimizedEdgeMeshPairs(edges) {
+  if (edges.length < 2) return [];
+  const parent = new Map(edges.map((edge) => [edge.id, edge.id]));
+  const find = (id) => {
+    let current = id;
+    while (parent.get(current) !== current) current = parent.get(current);
+    return current;
+  };
+  const merge = (a, b) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra === rb) return false;
+    parent.set(rb, ra);
+    return true;
+  };
+  const selected = new Map();
+  for (const pair of topologyPairsByDistance(edges)) {
+    if (merge(pair.a.id, pair.b.id)) selected.set(linkKey(pair.a, pair.b), pair);
+  }
+  const peerCount = edges.length <= 12 ? 3 : 2;
+  for (const edge of edges) {
+    for (const peer of nearestNodes(edge, edges, peerCount, { sameZoneBonus: 0.72 })) {
+      selected.set(linkKey(edge, peer), { a: edge, b: peer, d: distance(edge, peer) });
+    }
+  }
+  return [...selected.values()];
+}
+
+function terminalsByGateway(terminals) {
+  const groups = new Map();
+  for (const terminal of terminals) {
+    const key = terminal.gatewayEdgeId || 'ungrouped';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(terminal);
+  }
+  return groups;
+}
+
+function assignTerminalsToEdges(terminals, edges) {
+  if (!terminals.length || !edges.length) return;
+  const capacity = Math.ceil(terminals.length / edges.length);
+  const assigned = new Map(edges.map((edge) => [edge.id, 0]));
+  const orderedTerminals = [...terminals].sort((left, right) => (
+    Math.min(...edges.map((edge) => distance(left, edge)))
+    - Math.min(...edges.map((edge) => distance(right, edge)))
+  ));
+
+  for (const terminal of orderedTerminals) {
+    const ranked = [...edges]
+      .sort((left, right) => distance(terminal, left) - distance(terminal, right));
+    const gateway = ranked.find((edge) => assigned.get(edge.id) < capacity) || ranked[0];
+    const backup = ranked.find((edge) => edge.id !== gateway.id) || gateway;
+    terminal.gatewayEdgeId = gateway.id;
+    terminal.backupEdgeId = backup.id;
+    terminal.edgeDomain = `EDGE-${String(edges.indexOf(gateway) + 1).padStart(2, '0')}`;
+    assigned.set(gateway.id, (assigned.get(gateway.id) || 0) + 1);
+  }
+}
+
+function createTerminalAdHocMesh(terminals) {
+  const selected = new Map();
+  for (const group of terminalsByGateway(terminals).values()) {
+    if (group.length < 2) continue;
+    const peerCount = group.length <= 10 ? 2 : 3;
+    for (const terminal of group) {
+      for (const peer of nearestNodes(terminal, group, peerCount)) {
+        selected.set(linkKey(terminal, peer), { a: terminal, b: peer, d: distance(terminal, peer) });
+      }
+    }
+  }
+  for (const pair of [...selected.values()]) {
+    createPhysicalLink(pair.a.id, pair.b.id, {
+      role: 'terminal-peer',
+      persistent: true,
+      active: true,
+      force: true,
+      selfOrganized: true,
+      medium: 'wireless',
+      topologyLayer: 'terminal-ad-hoc'
+    });
+  }
+}
+
+function assignMultiHopRelayHints(terminals, edges, cloud) {
+  const edgeById = new Map(edges.map((edge) => [edge.id, edge]));
+  for (const terminal of terminals) {
+    delete terminal.multiHopRelay;
+    if (idNumber(terminal.id) % 4 !== 0) continue;
+
+    const gateway = edgeById.get(terminal.gatewayEdgeId);
+    if (!gateway) continue;
+
+    const sameGatewayPeers = terminals.filter((peer) => (
+      peer.id !== terminal.id
+      && (peer.gatewayEdgeId === gateway.id || peer.backupEdgeId === gateway.id)
+    ));
+    const peer = nearestNodes(terminal, sameGatewayPeers, 1)[0];
+    const edgeRelay = nearestNodes(gateway, edges.filter((edge) => edge.id !== gateway.id), 1, { sameZoneBonus: 0.82 })[0];
+
+    if (peer && idNumber(terminal.id) % 8 === 0) {
+      createPhysicalLink(terminal.id, peer.id, {
+        role: 'terminal-peer',
+        persistent: true,
+        active: true,
+        force: true,
+        selfOrganized: true,
+        medium: 'wireless',
+        topologyLayer: 'terminal-relay-hop'
+      });
+      createPhysicalLink(peer.id, gateway.id, {
+        role: 'terminal-edge',
+        persistent: true,
+        active: true,
+        force: true,
+        selfOrganized: false,
+        medium: 'wireless',
+        topologyLayer: 'terminal-relay-access'
+      });
+      terminal.multiHopRelay = {
+        mode: 'terminal-terminal-edge-cloud',
+        relayTerminalId: peer.id,
+        gatewayEdgeId: gateway.id,
+        cloudId: cloud.id,
+        hopCount: 3
+      };
+      continue;
+    }
+
+    if (edgeRelay) {
+      createPhysicalLink(gateway.id, edgeRelay.id, {
+        role: 'edge-mesh',
+        persistent: true,
+        active: true,
+        force: true,
+        selfOrganized: true,
+        medium: 'wireless',
+        topologyLayer: 'edge-relay-backbone'
+      });
+      terminal.multiHopRelay = {
+        mode: 'terminal-edge-edge-cloud',
+        gatewayEdgeId: gateway.id,
+        relayEdgeId: edgeRelay.id,
+        cloudId: cloud.id,
+        hopCount: 3
+      };
+    }
+  }
+}
+
 function createStableTopology() {
   const cloud = nodes.find((node) => node.type === 'Cloud');
   const edges = nodes.filter((node) => node.type === 'Edge');
@@ -269,45 +673,45 @@ function createStableTopology() {
       role: 'edge-cloud',
       persistent: true,
       active: true,
-      force: true
+      force: true,
+      selfOrganized: false,
+      medium: 'wired',
+      topologyLayer: 'cloud-backhaul'
     });
-    const meshPeers = nearestNodes(edge, edges, edges.length <= 20 ? 3 : 2, { sameZoneBonus: 0.62 });
-    for (const peer of meshPeers) {
-      createPhysicalLink(edge.id, peer.id, {
-        role: 'edge-mesh',
-        persistent: true,
-        active: true,
-        force: true
-      });
-    }
   }
 
+  for (const pair of optimizedEdgeMeshPairs(edges)) {
+    createPhysicalLink(pair.a.id, pair.b.id, {
+      role: 'edge-mesh',
+      persistent: true,
+      active: true,
+      force: true,
+      selfOrganized: true,
+      medium: 'wireless',
+      topologyLayer: 'edge-self-organized-backbone'
+    });
+  }
+
+  assignTerminalsToEdges(terminals, edges);
   for (const terminal of terminals) {
-    const gateways = nearestNodes(terminal, edges, 2, { sameZoneBonus: 0.42 });
-    terminal.gatewayEdgeId = gateways[0]?.id || edges[0].id;
-    terminal.backupEdgeId = gateways[1]?.id || terminal.gatewayEdgeId;
-    for (const gateway of gateways) {
-      createPhysicalLink(terminal.id, gateway.id, {
-        role: 'terminal-edge',
-        persistent: true,
-        active: true,
-        force: true
-      });
-    }
-
-    const peers = nearestNodes(terminal, terminals.filter((node) => node.zone === terminal.zone), 1);
-    for (const peer of peers) {
-      createPhysicalLink(terminal.id, peer.id, {
-        role: 'terminal-peer',
-        persistent: false,
-        active: false,
-        force: true
-      });
-    }
+    const gateway = getNode(terminal.gatewayEdgeId) || edges[0];
+    createPhysicalLink(terminal.id, gateway.id, {
+      role: 'terminal-edge',
+      persistent: true,
+      active: true,
+      force: true,
+      selfOrganized: false,
+      medium: 'wireless',
+      topologyLayer: 'terminal-access'
+    });
   }
+
+  createTerminalAdHocMesh(terminals);
+  assignMultiHopRelayHints(terminals, edges, cloud);
 }
 
 function applyForceLayout() {
+  if (csvTopologyRecords.length) return;
   // Scale iterations to keep perf reasonable: fewer iters for larger networks
   const iterations = nodes.length <= 200 ? 80 : nodes.length <= 500 ? 50 : nodes.length <= 1000 ? 30 : 18;
   // Use potential connections (within LINK_RADIUS) as the attract/repel basis
@@ -440,12 +844,21 @@ function linkBetween(a, b) {
   return {
     a, b,
     distance: Number((d * 1000).toFixed(1)),
-    bandwidth: Math.round(between(160, 900)),
+    bandwidth: Math.round(between(160, 900) * bandwidthScale()),
     latency: Math.round(between(4, 38) + d * 70),
     loss: Number(between(0.1, 2.8).toFixed(2)),
     utilization: 0.2,
+    reservedMbps: 0,
     active: true
   };
+}
+
+function availableNetworkBandwidth() {
+  const reserved = links.reduce((sum, link) => sum + Math.max(0, Number(link.reservedMbps || 0)), 0);
+  const utilization = links.length
+    ? links.reduce((sum, link) => sum + link.utilization, 0) / links.length
+    : 0;
+  return Math.max(0, TOTAL_NETWORK_BANDWIDTH * (1 - utilization * 0.45) - reserved);
 }
 
 function pathMetrics(pathIds) {
@@ -458,7 +871,9 @@ function pathMetrics(pathIds) {
     if (!link) return null;
     pathLinks.push(link);
   }
-  const bottleneck = Math.min(...pathLinks.map((link) => link.bandwidth * (1 - link.utilization)));
+  const bottleneck = Math.min(...pathLinks.map((link) => (
+    Math.max(0, link.bandwidth * (1 - link.utilization) - Number(link.reservedMbps || 0))
+  )));
   const latency = pathLinks.reduce((sum, link) => sum + link.latency, 0);
   const loss = pathLinks.reduce((sum, link) => sum + link.loss, 0);
   const utilization = pathLinks.reduce((sum, link) => sum + link.utilization, 0) / pathLinks.length;
@@ -495,12 +910,27 @@ function bestGatewayForTerminal(terminal) {
     .sort((left, right) => right.score - left.score)[0]?.edge || null;
 }
 
+function hintedMultiHopRoute(terminal, cloud) {
+  const hint = terminal?.multiHopRelay;
+  if (!hint || !cloud) return null;
+  let path = null;
+  if (hint.mode === 'terminal-terminal-edge-cloud') {
+    path = [terminal.id, hint.relayTerminalId, hint.gatewayEdgeId, cloud.id];
+  } else if (hint.mode === 'terminal-edge-edge-cloud') {
+    path = [terminal.id, hint.gatewayEdgeId, hint.relayEdgeId, cloud.id];
+  }
+  if (!path || path.some((nodeId) => !nodeId || !getNode(nodeId))) return null;
+  return pathMetrics(path) ? path : null;
+}
+
 function buildUplinkRoute(originId) {
   const origin = getNode(originId);
   const cloud = nodes.find((node) => node.type === 'Cloud');
   if (!origin || !cloud) return null;
   if (origin.type === 'Cloud') return [origin.id];
   if (origin.type === 'Edge') return [origin.id, cloud.id];
+  const relayRoute = hintedMultiHopRoute(origin, cloud);
+  if (relayRoute) return relayRoute;
   const gateway = bestGatewayForTerminal(origin);
   if (!gateway) return null;
   return [origin.id, gateway.id, cloud.id];
@@ -552,7 +982,7 @@ function defaultSituationDescription(source, imageName) {
   const geo = nodeGeo(source);
   const lat = geo.latitude.toFixed(4);
   const lng = geo.longitude.toFixed(4);
-  return `${source.id} 终端在 ${lat}, ${lng} 采集到 ${imageName || '遥感图'}：图中可见海域背景、多条态势航迹线及若干目标标注，疑似存在海面/空中平台协同活动，建议上传云端进行态势融合展示。`;
+  return `${source.id} 终端在 ${lat}, ${lng} 采集到 ${imageName || '态势数据'}：图中可见海域背景、多条态势航迹线及若干目标标注，疑似存在海面/空中平台协同活动，建议上传云端进行态势融合展示。`;
 }
 
 function createSituationDescriptionRecord(options = {}) {
@@ -566,7 +996,7 @@ function createSituationDescriptionRecord(options = {}) {
   if (!path?.length || path.length < 2) {
     return { error: 'no_uplink_route', message: `${source.id} 暂无可用上行链路` };
   }
-  const imageName = String(options.imageName || '遥感图').slice(0, 120);
+  const imageName = String(options.imageName || '态势数据').slice(0, 120);
   const description = String(options.description || '').trim().slice(0, 1200) || defaultSituationDescription(source, imageName);
   const geo = nodeGeo(source);
   const tags = Array.isArray(options.tags)
@@ -618,6 +1048,7 @@ function createSituationDescriptionRecord(options = {}) {
     path,
     data: sampleSizeMb,
     priority: options.priority || '高',
+    delayMs: Math.round(between(150, 1100)),
     speedMultiplier: 24
   });
   if (journey) {
@@ -636,6 +1067,11 @@ function createPacketJourney(options) {
   if (!path?.length) return null;
   for (let i = 0; i < path.length - 1; i += 1) ensureLink(path[i], path[i + 1]);
   const metrics = pathMetrics(path) || { bottleneck: 120, latency: 0, loss: 0 };
+  const explicitDelay = Number(options.delayMs || 0);
+  const jitter = explicitDelay > 0
+    ? Math.round(between(-Math.min(300, explicitDelay * 0.5), 500))
+    : Math.round(between(80, 900));
+  const delayMs = Math.max(0, explicitDelay + jitter);
   const journey = {
     id: `P${String(nextPacketId++).padStart(4, '0')}`,
     taskId: options.taskId,
@@ -649,10 +1085,10 @@ function createPacketJourney(options) {
     data: Math.max(1, Math.round(options.data || 1)),
     priority: options.priority || '中',
     createdAt: Date.now(),
-    startAt: Date.now() + Number(options.delayMs || 0),
+    startAt: Date.now() + delayMs,
     progress: 0,
     currentHop: 0,
-    status: Number(options.delayMs || 0) > 0 ? 'waiting' : 'transmitting',
+    status: delayMs > 0 ? 'waiting' : 'transmitting',
     latency: Math.round(metrics.latency || 0),
     bottleneck: Math.round(metrics.bottleneck || 0),
     loss: Number((metrics.loss || 0).toFixed(2)),
@@ -695,15 +1131,17 @@ function attachPacketJourneys(task) {
       path: downlink,
       data: Math.max(8, task.demand.data * 0.08),
       priority: task.priority,
-      delayMs: 1200
+      delayMs: Math.round(between(600, 2200))
     }));
   }
   task.packetIds = journeys.filter(Boolean).map((journey) => journey.id);
 }
 
-function twoHopCandidates(originId, demand) {
+function twoHopCandidates(originId, demand, options = {}) {
   const map = neighborMap();
   const candidateMap = new Map();
+  const executionPool = options.executionPool?.length ? new Set(options.executionPool) : null;
+  const eligible = (node) => !executionPool || executionPool.has(node.id);
   const addCandidate = (candidate) => {
     if (!candidate?.node) return;
     const previous = candidateMap.get(candidate.node.id);
@@ -713,7 +1151,7 @@ function twoHopCandidates(originId, demand) {
   nodes
     .map((node) => {
       const path = findPathWithinTwoHops(originId, node.id, map);
-      if (!path || node.status !== 'online') return null;
+      if (!path || node.status !== 'online' || !eligible(node)) return null;
       const metrics = pathMetrics(path);
       if (!metrics) return null;
       const resourceScore = node.computeFree / Math.max(1, node.computeTotal) + node.storageFree / Math.max(1, node.storageTotal);
@@ -748,7 +1186,7 @@ function twoHopCandidates(originId, demand) {
   ].filter(Boolean);
 
   for (const node of fallbackNodes) {
-    if (node.status !== 'online') continue;
+    if (node.status !== 'online' || !eligible(node)) continue;
     if (node.computeFree < demand.compute * 0.04 || node.storageFree < demand.storage * 0.035) continue;
     const uplink = buildUplinkRoute(originId);
     let path = null;
@@ -783,6 +1221,99 @@ function splitWeight(candidate) {
   const storageRatio = candidate.node.storageFree / Math.max(1, candidate.node.storageTotal);
   const commRatio = clamp(candidate.metrics.bottleneck / 900, 0.05, 1.6);
   return Math.max(0.05, computeRatio * 0.42 + storageRatio * 0.28 + commRatio * 0.3);
+}
+
+function normalizeImagePayload(payload = {}) {
+  const sourceBytes = Number(payload.imageSizeBytes ?? payload.sizeBytes ?? 0);
+  const sourceMb = Number(payload.sourceImageMb ?? (sourceBytes / (1024 * 1024)));
+  if (!Number.isFinite(sourceMb) || sourceMb <= 0) {
+    return { error: 'invalid_image', message: '请先选择有效图像，再启动任务。' };
+  }
+  const compressedMb = Number((sourceMb / 3).toFixed(3));
+  const targetCount = clamp(Math.round(Number(payload.targetCount || TS_TARGET_COUNT)), 1, 200);
+  return {
+    name: String(payload.imageName || '待分析图像').slice(0, 120),
+    sourceBytes: Math.round(sourceBytes || sourceMb * 1024 * 1024),
+    sourceMb: Number(sourceMb.toFixed(3)),
+    compressedMb,
+    compressionRatio: 1 / 3,
+    targetCount,
+    description: `图像压缩为原始大小的 1/3，算法将按 ${compressedMb} MB 图像内存、节点可用资源和链路带宽进行分布式调度。`
+  };
+}
+
+function imageDemand(image, sequence = 0) {
+  const targetFactor = image.targetCount * 7;
+  const jitter = 0.88 + ((sequence * 37) % 17) / 100;
+  return {
+    compute: Math.max(140, Math.round((220 + image.compressedMb * 82 + targetFactor) * jitter)),
+    storage: Math.max(56, Math.round((48 + image.compressedMb * 1.8 + image.targetCount * 0.7) * jitter)),
+    data: Math.max(1, Number((image.compressedMb * (0.94 + (sequence % 5) * 0.03)).toFixed(2)))
+  };
+}
+
+function terminalSchedulingScore(terminal) {
+  const gateway = getNode(terminal.gatewayEdgeId);
+  const access = gateway ? activeLinkBetween(terminal.id, gateway.id, 'terminal-edge') : null;
+  const memoryRatio = terminal.storageFree / Math.max(1, terminal.storageTotal);
+  const computeRatio = terminal.computeFree / Math.max(1, terminal.computeTotal);
+  const pathBandwidth = access
+    ? Math.max(0, access.bandwidth * (1 - access.utilization) - Number(access.reservedMbps || 0))
+    : 0;
+  return memoryRatio * 0.48 + computeRatio * 0.24 + clamp(pathBandwidth / 500, 0, 1) * 0.28;
+}
+
+function chooseDistributedWorkers(count = 20) {
+  const edges = nodes.filter((node) => node.type === 'Edge' && node.status === 'online');
+  const terminals = nodes.filter((node) => node.type === 'Terminal' && node.status === 'online');
+  const selected = [];
+  for (const edge of edges) {
+    const domainCandidates = terminals
+      .filter((node) => node.gatewayEdgeId === edge.id)
+      .sort((left, right) => terminalSchedulingScore(right) - terminalSchedulingScore(left))
+      .slice(0, 2);
+    selected.push(edge, ...domainCandidates);
+  }
+  const candidates = [...nodes]
+    .filter((node) => node.status === 'online' && node.type !== 'Cloud')
+    .sort((left, right) => {
+      const leftScore = left.type === 'Edge'
+        ? left.computeFree / left.computeTotal + left.storageFree / left.storageTotal
+        : terminalSchedulingScore(left);
+      const rightScore = right.type === 'Edge'
+        ? right.computeFree / right.computeTotal + right.storageFree / right.storageTotal
+        : terminalSchedulingScore(right);
+      return rightScore - leftScore;
+    });
+  for (const node of candidates) {
+    if (selected.some((item) => item.id === node.id)) continue;
+    selected.push(node);
+    if (selected.length >= count) break;
+  }
+  return selected.slice(0, count).map((node) => node.id);
+}
+
+function sampleItems(items, count) {
+  const pool = [...items];
+  const selected = [];
+  while (pool.length && selected.length < count) {
+    const index = Math.floor(random() * pool.length);
+    selected.push(pool.splice(index, 1)[0]);
+  }
+  return selected;
+}
+
+function chooseBatchOrigins() {
+  const origins = [];
+  for (const edge of nodes.filter((node) => node.type === 'Edge')) {
+    const terminals = nodes.filter((node) => (
+      node.type === 'Terminal'
+      && node.status === 'online'
+      && node.gatewayEdgeId === edge.id
+    ));
+    origins.push(...sampleItems(terminals, Math.min(5, terminals.length)));
+  }
+  return origins;
 }
 
 function buildTaskGraph(taskId, originId, fragments, demand) {
@@ -836,18 +1367,21 @@ function createTask(payload = {}) {
   const online = nodes.filter((node) => node.status === 'online');
   const terminalOrigins = online.filter((node) => node.type === 'Terminal');
   const origin = payload.origin && getNode(payload.origin) ? getNode(payload.origin) : choose(terminalOrigins.length ? terminalOrigins : online);
+  const image = payload.image || null;
   const demand = {
     compute: Number(payload.compute || Math.round(between(520, 1680))),
     storage: Number(payload.storage || Math.round(between(220, 820))),
     data: Number(payload.data || Math.round(between(180, 920)))
   };
   const priority = payload.priority || choose(['低', '中', '高', '紧急']);
-  const splitStrategy = payload.splitStrategy || 'equal';
-  const candidates = twoHopCandidates(origin.id, demand).slice(0, 12);
+  const splitStrategy = payload.splitStrategy || 'resourceWeighted';
+  const candidates = twoHopCandidates(origin.id, demand, {
+    executionPool: payload.executionPool
+  }).slice(0, 20);
   let remainingCompute = demand.compute;
   let remainingStorage = demand.storage;
   const fragments = [];
-  const selected = candidates.slice(0, Math.min(candidates.length, Number(payload.fragmentCount || 12)));
+  const selected = candidates.slice(0, Math.min(candidates.length, Number(payload.fragmentCount || 8)));
 
   for (let index = 0; index < selected.length; index += 1) {
     const candidate = selected[index];
@@ -866,6 +1400,7 @@ function createTask(payload = {}) {
     if (computeSlice < Math.min(16, demand.compute * 0.03) || storageSlice < Math.min(8, demand.storage * 0.03)) continue;
     candidate.node.computeFree -= computeSlice;
     candidate.node.storageFree -= storageSlice;
+    candidate.node.memoryFree = candidate.node.storageFree;
     remainingCompute -= computeSlice;
     remainingStorage -= storageSlice;
     fragments.push({
@@ -892,8 +1427,14 @@ function createTask(payload = {}) {
   // Materialize links along fragment paths — links are created only when data flows
   if (accepted) {
     for (const fragment of fragments) {
+      fragment.reservedMbps = Math.max(4, Math.min(fragment.bottleneck * 0.32, fragment.data / 2.8));
+      fragment.reservedLinkIds = [];
       for (let i = 0; i < fragment.path.length - 1; i += 1) {
-        ensureLink(fragment.path[i], fragment.path[i + 1]);
+        const link = ensureLink(fragment.path[i], fragment.path[i + 1]);
+        if (link) {
+          link.reservedMbps = Number((Number(link.reservedMbps || 0) + fragment.reservedMbps).toFixed(2));
+          fragment.reservedLinkIds.push(link.id);
+        }
       }
     }
   }
@@ -906,13 +1447,22 @@ function createTask(payload = {}) {
     demand,
     priority,
     splitStrategy,
+    image,
+    targetCount: image?.targetCount || Number(payload.targetCount || 0),
+    scheduler: {
+      mode: payload.schedulerMode || 'distributed-resource-aware',
+      executionPool: payload.executionPool || [],
+      objective: 'image-memory + compute-free + path-bottleneck + network-budget'
+    },
     status: accepted ? 'dispatching' : 'rejected',
     accepted,
     remaining: { compute: Math.max(0, remainingCompute), storage: Math.max(0, remainingStorage) },
     fragments,
     taskGraph: buildTaskGraph(taskId, origin.id, fragments, demand),
     trace: fragments.flatMap((fragment) => fragment.path.map((nodeId, order) => ({ nodeId, order, fragmentId: fragment.id }))).slice(0, 80),
-    message: accepted ? '2-hop elastic scheduling accepted' : 'insufficient resource/link quality within 2 hops'
+    message: accepted
+      ? 'distributed image-memory and bandwidth scheduling accepted'
+      : 'insufficient memory, compute, or bandwidth within the distributed scheduling domain'
   };
 
   if (!accepted) releaseTaskResources(task);
@@ -929,8 +1479,67 @@ function releaseTaskResources(task) {
     if (!node) continue;
     node.computeFree = Math.min(node.computeTotal, node.computeFree + fragment.compute);
     node.storageFree = Math.min(node.storageTotal, node.storageFree + fragment.storage);
+    node.memoryFree = node.storageFree;
+    for (const linkId of fragment.reservedLinkIds || []) {
+      const link = links.find((item) => item.id === linkId);
+      if (link) {
+        link.reservedMbps = Math.max(0, Number((Number(link.reservedMbps || 0) - Number(fragment.reservedMbps || 0)).toFixed(2)));
+      }
+    }
   }
   task.released = true;
+}
+
+function createImageScenario(payload = {}) {
+  const image = normalizeImagePayload(payload);
+  if (image.error) return image;
+  const mode = payload.mode === 'batch60' ? 'batch60' : 'single';
+  const workerPool = mode === 'batch60' ? chooseDistributedWorkers(20) : [];
+  const origins = mode === 'batch60'
+    ? chooseBatchOrigins()
+    : [...nodes]
+      .filter((node) => node.type === 'Terminal' && node.status === 'online')
+      .sort((left, right) => terminalSchedulingScore(right) - terminalSchedulingScore(left))
+      .slice(0, 1);
+  if (!origins.length) return { error: 'no_origin', message: '当前没有可用终端节点。' };
+
+  const taskCount = mode === 'batch60' ? 60 : 1;
+  const createdTasks = [];
+  for (let index = 0; index < taskCount; index += 1) {
+    const origin = origins[index % origins.length];
+    const demand = imageDemand(image, index);
+    const task = createTask({
+      origin: origin.id,
+      ...demand,
+      image,
+      targetCount: image.targetCount,
+      splitStrategy: 'resourceWeighted',
+      fragmentCount: mode === 'batch60' ? 6 : 8,
+      executionPool: workerPool,
+      schedulerMode: mode === 'batch60' ? 'distributed-20-worker-pool' : 'distributed-image-task'
+    });
+    createdTasks.push(task);
+    broadcast('task', task);
+  }
+  const frame = createTSSensingFrame({
+    imageName: image.name,
+    targetCount: image.targetCount
+  });
+  lastScenarioRun = {
+    id: `RUN${String(Date.now()).slice(-8)}`,
+    mode,
+    image,
+    targetCount: image.targetCount,
+    taskCount,
+    origins: origins.map((node) => node.id),
+    workerPool,
+    acceptedTasks: createdTasks.filter((task) => task.accepted).length,
+    rejectedTasks: createdTasks.filter((task) => !task.accepted).length,
+    startedAt: Date.now(),
+    frameId: frame.id
+  };
+  queuePersistence(mode === 'batch60' ? 'batch_60_started' : 'single_image_started');
+  return { run: lastScenarioRun, tasks: createdTasks, frame };
 }
 
 function resetSimulation(opts = {}) {
@@ -938,8 +1547,8 @@ function resetSimulation(opts = {}) {
     NODE_COUNT = opts.nodeCount;
   }
   if (opts.edgeCount !== undefined && Number.isFinite(opts.edgeCount)) {
-    const maxEdge = Math.floor(NODE_COUNT * MAX_EDGE_RATIO);
-    EDGE_COUNT = Math.min(maxEdge, Math.max(3, Math.round(opts.edgeCount)));
+    const maxEdge = Math.max(1, NODE_COUNT - 1);
+    EDGE_COUNT = Math.min(maxEdge, Math.max(1, Math.round(opts.edgeCount)));
   } else {
     EDGE_COUNT = defaultEdgeCount(NODE_COUNT);
   }
@@ -960,14 +1569,13 @@ function resetSimulation(opts = {}) {
   nextPacketId = 1;
   nextTelemetryId = 1;
   nextTsFrameId = 1;
-  lastAutoTaskAt = 0;
   tickCount = 0;
   paused = false;
+  lastScenarioRun = null;
   createNodes();
   applyForceLayout();
   createStableTopology();
-  createTSSensingFrame({ imageName: '初始化遥感底图' });
-  createTask({ priority: '高' });
+  queuePersistence('simulation_reset');
   broadcast('state', snapshot());
 }
 
@@ -1015,6 +1623,10 @@ function simulateNodes() {
 }
 
 function simulateNodePhysics() {
+  if (csvTopologyRecords.length) {
+    updateActiveLinkDistances();
+    return;
+  }
   // Continuous force-directed motion with Brownian drift — nodes wander, links follow
   const linkSet = new Map();
   for (const link of links) {
@@ -1070,7 +1682,10 @@ function simulateNodePhysics() {
     nodes[i].y = clamp(nodes[i].y + forces[i].fy * dt + brownY, 0.06, 0.94);
   }
 
-  // Update link distances
+  updateActiveLinkDistances();
+}
+
+function updateActiveLinkDistances() {
   for (const link of links) {
     if (!link.active) continue;
     const a = getNode(link.a);
@@ -1229,6 +1844,12 @@ function dbLimit(url, fallback) {
 }
 
 function nodeGeo(node) {
+  if (Number.isFinite(node?.latitude) && Number.isFinite(node?.longitude)) {
+    return {
+      latitude: Number(node.latitude.toFixed(6)),
+      longitude: Number(node.longitude.toFixed(6))
+    };
+  }
   const latRange = MARITIME_BOUNDS.maxLat - MARITIME_BOUNDS.minLat;
   const lngRange = MARITIME_BOUNDS.maxLng - MARITIME_BOUNDS.minLng;
   return {
@@ -1436,6 +2057,9 @@ function databaseANodeSnapshots(limit = nodes.length) {
     node_id: node.id,
     name: node.name,
     type: node.type,
+    unit_name: node.unitName || node.name,
+    branch: node.branch || node.label,
+    source_columns: node.sourceColumns || null,
     zone: node.zone,
     latitude: nodeGeo(node).latitude,
     longitude: nodeGeo(node).longitude,
@@ -1451,6 +2075,10 @@ function databaseANodeSnapshots(limit = nodes.length) {
     status: node.status,
     gateway_edge_id: node.gatewayEdgeId || null,
     backup_edge_id: node.backupEdgeId || null,
+    uplink_route_mode: node.multiHopRelay?.mode || 'default',
+    uplink_hop_count: node.multiHopRelay?.hopCount || (node.type === 'Cloud' ? 0 : node.type === 'Edge' ? 1 : 2),
+    relay_terminal_id: node.multiHopRelay?.relayTerminalId || null,
+    relay_edge_id: node.multiHopRelay?.relayEdgeId || null,
     snapshot_at: toIso(Date.now())
   }));
 }
@@ -1469,11 +2097,16 @@ function linkAck(link) {
 }
 
 function databaseALinkStatus(limit = links.length) {
-  return links.slice(0, limit).map((link) => ({
+  return links.slice(0, limit).map((link) => {
+    const na = getNode(link.a);
+    const nb = getNode(link.b);
+    return {
     link_id: link.id,
     node_a: link.a,
     node_b: link.b,
     role: link.role,
+    hops_a: na?.hopsToCloud ?? null,
+    hops_b: nb?.hopsToCloud ?? null,
     bandwidth_mbps: Math.round(link.bandwidth),
     latency_ms: Number(link.latency.toFixed(1)),
     loss_rate: Number(link.loss.toFixed(2)),
@@ -1481,9 +2114,13 @@ function databaseALinkStatus(limit = links.length) {
     distance_m: Number(link.distance.toFixed(1)),
     active: Boolean(link.active),
     persistent: Boolean(link.persistent),
+    self_organized: Boolean(link.selfOrganized),
+    medium: link.medium || null,
+    topology_layer: link.topologyLayer || null,
     ...linkAck(link),
     recorded_at: toIso(Date.now())
-  }));
+  };
+  });
 }
 
 function databaseATasks(limit = 80) {
@@ -1551,6 +2188,7 @@ function databaseAPacketJourneys(limit = 120) {
     origin_node_id: journey.origin,
     target_node_id: journey.target,
     path: journey.path,
+    hop_count: Math.max(0, journey.path.length - 1),
     data_mb: Math.round(journey.data),
     priority: journey.priority,
     progress: Number((journey.progress || 0).toFixed(3)),
@@ -1694,6 +2332,8 @@ function databaseAInterfaces() {
 function snapshot() {
   const onlineNodes = nodes.filter((node) => node.status === 'online').length;
   const activeLinks = links.filter((link) => link.active).length;
+  const selfOrganizedLinks = links.filter((link) => link.selfOrganized).length;
+  const activeSelfOrganizedLinks = links.filter((link) => link.selfOrganized && link.active).length;
   const avgUtil = links.length ? links.reduce((sum, link) => sum + link.utilization, 0) / links.length : 0;
   const runningTasks = tasks.filter((task) => ['dispatching', 'running'].includes(task.status)).length;
   const nodeTypes = nodes.reduce((counts, node) => {
@@ -1709,6 +2349,10 @@ function snapshot() {
       nodeCount: nodes.length,
       onlineNodes,
       activeLinks,
+      selfOrganizedLinks,
+      activeSelfOrganizedLinks,
+      edgeMeshLinks: links.filter((link) => link.role === 'edge-mesh').length,
+      terminalPeerLinks: links.filter((link) => link.role === 'terminal-peer').length,
       totalLinks: links.length,
       avgUtilization: Number(avgUtil.toFixed(2)),
       nodeTypes,
@@ -1726,7 +2370,11 @@ function snapshot() {
       completeTasks: tasks.filter((task) => task.status === 'complete').length,
       rejectedTasks: tasks.filter((task) => task.status === 'rejected').length
     },
-    nodes,
+    nodes: nodes.map((node) => ({
+      ...node,
+      latitude: nodeGeo(node).latitude,
+      longitude: nodeGeo(node).longitude
+    })),
     links,
     tasks: tasks.slice(0, 18).map((task) => ({
       ...task,
